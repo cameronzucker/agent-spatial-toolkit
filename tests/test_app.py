@@ -593,3 +593,46 @@ def test_anchors_route_intrinsics_dict_still_works_backward_compat(app_factory) 
     payload = _valid_anchors_payload()
     resp = client.post("/api/anchors", json=payload)
     assert resp.status_code == 200, resp.get_json()
+
+
+# Append to tests/test_app.py
+
+
+def test_wireframe_route_returns_png_after_pose_solved(app_factory) -> None:
+    """GET /api/wireframe/<photo_id> renders + serves a PNG once pose is solved."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    # First POST anchors so a pose exists
+    payload = _valid_anchors_payload()
+    resp = client.post("/api/anchors", json=payload)
+    assert resp.status_code == 200, resp.get_json()
+
+    photo_id = payload["photo_id"]
+    resp = client.get(f"/api/wireframe/{photo_id}")
+    assert resp.status_code == 200, resp.data[:200]
+    assert resp.mimetype == "image/png"
+    # PNG signature first 8 bytes
+    assert resp.data.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_wireframe_route_returns_404_when_no_pose(app_factory) -> None:
+    """GET /api/wireframe/<photo_id> returns 404 if no pose has been solved."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    resp = client.get("/api/wireframe/never_seen")
+    assert resp.status_code == 404
+    assert "error" in resp.get_json()
+
+
+def test_wireframe_route_rejects_path_traversal(app_factory) -> None:
+    """GET /api/wireframe with traversal segments returns 404 (or 400), never reads outside session dir."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    # Flask's <path:...> converter accepts slashes; the route handler must
+    # call secure_filename and reject anything that resolves outside.
+    for evil in ["..%2Fetc%2Fpasswd", "../../etc/passwd", "subdir/../escape"]:
+        resp = client.get(f"/api/wireframe/{evil}")
+        assert resp.status_code in (400, 404), (
+            f"Expected 400/404 for {evil!r}; got {resp.status_code}"
+        )

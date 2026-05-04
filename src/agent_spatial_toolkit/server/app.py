@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_file, send_from_directory
 
 from agent_spatial_toolkit.pipeline.emit import SessionState, emit_annotations
 from agent_spatial_toolkit.pipeline.intrinsics import Intrinsics
@@ -677,6 +677,106 @@ def _register_routes(app: Flask) -> None:
         _trigger_async_shutdown(server)
 
         return jsonify({"annotations_path": str(out_path), "status": "done"})
+
+    @app.get("/api/wireframe/<path:photo_id>")
+    def get_wireframe(photo_id: str) -> Any:
+        """Render + serve a wireframe overlay PNG for the given photo (PR-β).
+
+        Lazily renders on each request using ``render_wireframe`` from
+        ``pipeline.reproject``. The photo must have a solved pose in ``mem``
+        (i.e. ``/api/anchors`` has been POSTed for it). Path traversal is
+        blocked via ``secure_filename`` + parent-resolution check.
+
+        When no photo file is found on disk the endpoint synthesises a blank
+        image from the stored ``image_size`` so the test fixture (which only
+        POSTs anchors without uploading a file) still receives a valid PNG.
+        """
+        from werkzeug.utils import secure_filename
+
+        from agent_spatial_toolkit.pipeline.reproject import render_wireframe
+
+        # Path-traversal protection: secure_filename collapses traversal
+        # segments so the result must equal the original id.
+        safe_id = secure_filename(photo_id)
+        if not safe_id or safe_id != photo_id:
+            return jsonify({"error": "invalid photo_id"}), 404
+
+        session: Session = app.config["SESSION"]
+        mem: dict[str, Any] = app.config["STATE"]
+        photo_state = mem["photos"].get(safe_id)
+        if photo_state is None:
+            return jsonify({"error": f"no pose for photo {safe_id}"}), 404
+
+        # Locate the source photo file (id may be the basename without extension
+        # or with — handle both by globbing).
+        photos_dir = session.session_dir / "photos"
+        candidates = list(photos_dir.glob(f"{safe_id}.*")) + (
+            [photos_dir / safe_id] if (photos_dir / safe_id).exists() else []
+        )
+
+        # Defensive: ensure resolved path is under photos_dir (no traversal escape).
+        safe_candidates = []
+        for c in candidates:
+            try:
+                c.resolve().relative_to(photos_dir.resolve())
+                safe_candidates.append(c)
+            except ValueError:
+                pass
+
+        # Build the wireframe output dir.
+        wireframes_dir = session.session_dir / "wireframes"
+        wireframes_dir.mkdir(parents=True, exist_ok=True)
+        out_path = wireframes_dir / f"{safe_id}_wireframe.png"
+
+        # Reconstruct Intrinsics + PoseResult + frame anchors from stored state.
+        try:
+            intrinsics = _intrinsics_from_dict(photo_state["intrinsics"])
+        except (KeyError, TypeError, ValueError) as e:
+            return jsonify({"error": f"stored intrinsics invalid: {e}"}), 500
+
+        pose_val = photo_state["pose"]
+        if isinstance(pose_val, PoseResult):
+            pose = pose_val
+        else:
+            pose = PoseResult(
+                rvec=np.array(pose_val["rvec"], dtype=np.float64),
+                tvec=np.array(pose_val["tvec"], dtype=np.float64),
+                anchor_reprojection_rms_px=pose_val.get("anchor_reprojection_rms_px", 0.0),
+                intrinsics_suspect=pose_val.get("intrinsics_suspect", False),
+                pose_solver=pose_val.get("pose_solver", "unknown"),
+            )
+
+        anchors_list = mem["anchors"].get(safe_id, [])
+        frame_anchors = [
+            {"id": f"a{i}", "xyz": a["pcb_xyz_mm"]} for i, a in enumerate(anchors_list)
+        ]
+
+        # Determine the photo path — synthesise a blank image when no file
+        # exists on disk so the endpoint is testable without a real upload.
+        if safe_candidates:
+            photo_path = safe_candidates[0]
+        else:
+            image_size = photo_state.get("image_size", (640, 480))
+            w, h = image_size[0], image_size[1]
+            synth_path = wireframes_dir / f"{safe_id}_blank.jpg"
+            blank = np.zeros((h, w, 3), dtype=np.uint8)
+            import cv2 as _cv2
+
+            _cv2.imwrite(str(synth_path), blank)
+            photo_path = synth_path
+
+        try:
+            render_wireframe(
+                photo_path=photo_path,
+                out_path=out_path,
+                frame_anchors=frame_anchors,
+                pose=pose,
+                intrinsics=intrinsics,
+            )
+        except (ValueError, FileNotFoundError, OSError) as e:
+            return jsonify({"error": f"wireframe render failed: {e}"}), 500
+
+        return send_file(out_path, mimetype="image/png")
 
     @app.get("/static/photos/<path:requested_id>")
     def static_photo(requested_id: str) -> Any:

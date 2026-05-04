@@ -535,6 +535,107 @@ JSON
     [[ "$status" -eq 5 ]]
 }
 
+@test "safe-git refuses checkout -b <newname> off-lease (NB1)" {
+    # NB1: branch creation must not be reachable from safe-git. Even when the
+    # caller holds a lease, `checkout -b evil` would let HEAD escape to a
+    # branch the lease never named.
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<JSON
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"leased","branch":"feat/t","attempts":1,"depends_on":[]}
+  ],
+  "current_lease": {
+    "task_id":"TASK-1",
+    "session_id":"sess-A",
+    "branch":"feat/t",
+    "head_sha_at_lease_start":"deadbeef",
+    "cwd_root":"$AUTO_CLAUDE_REPO_ROOT",
+    "acquired_at":"2026-05-04T00:00:00Z"
+  }
+}
+JSON
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/safe-git" checkout -b evil
+    [[ "$status" -eq 4 ]]
+    [[ "$output" == *"REFUSED"* ]]
+    [[ "$output" == *"branch creation"* ]]
+    # And the audit recorded the refusal with the right reason.
+    run grep -c '"reason":"checkout-create-off-lease"' "$AUTO_CLAUDE_REPO_ROOT/.handoff/events.jsonl"
+    [[ "$output" -ge 1 ]]
+}
+
+@test "safe-git refuses checkout -B <newname> off-lease (NB1)" {
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<JSON
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"leased","branch":"feat/t","attempts":1,"depends_on":[]}
+  ],
+  "current_lease": {
+    "task_id":"TASK-1",
+    "session_id":"sess-A",
+    "branch":"feat/t",
+    "head_sha_at_lease_start":"deadbeef",
+    "cwd_root":"$AUTO_CLAUDE_REPO_ROOT",
+    "acquired_at":"2026-05-04T00:00:00Z"
+  }
+}
+JSON
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/safe-git" checkout -B evil
+    [[ "$status" -eq 4 ]]
+    [[ "$output" == *"branch creation"* ]]
+}
+
+@test "safe-git refuses switch --create <newname> off-lease (NB1)" {
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<JSON
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"leased","branch":"feat/t","attempts":1,"depends_on":[]}
+  ],
+  "current_lease": {
+    "task_id":"TASK-1",
+    "session_id":"sess-A",
+    "branch":"feat/t",
+    "head_sha_at_lease_start":"deadbeef",
+    "cwd_root":"$AUTO_CLAUDE_REPO_ROOT",
+    "acquired_at":"2026-05-04T00:00:00Z"
+  }
+}
+JSON
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/safe-git" switch --create evil
+    [[ "$status" -eq 4 ]]
+    [[ "$output" == *"branch creation"* ]]
+}
+
+@test "safe-git refuses checkout -b even when name equals lease branch (NB1)" {
+    # Even if the new name matches the lease branch, branch creation via
+    # safe-git is unconditionally refused — only session_boot.sh creates
+    # branches (using raw git after the lease is in place).
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<JSON
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"leased","branch":"feat/t","attempts":1,"depends_on":[]}
+  ],
+  "current_lease": {
+    "task_id":"TASK-1",
+    "session_id":"sess-A",
+    "branch":"feat/t",
+    "head_sha_at_lease_start":"deadbeef",
+    "cwd_root":"$AUTO_CLAUDE_REPO_ROOT",
+    "acquired_at":"2026-05-04T00:00:00Z"
+  }
+}
+JSON
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/safe-git" checkout -b feat/t
+    [[ "$status" -eq 4 ]]
+}
+
 @test "safe-git refuses commit when no lease and tree dirty" {
     source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
     state_init

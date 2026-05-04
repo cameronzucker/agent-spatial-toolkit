@@ -132,12 +132,17 @@ if ! state_acquire_lease "$task_id" "$session_id" "$task_branch" "$head_sha"; th
 fi
 state_set_task_phase "$task_id" "branch_created" || true
 
-# Create the branch
+# Create the branch.
+#
+# safe-git refuses ALL `checkout -b/-B` and `switch --create` (NB1) — branch
+# creation is the boot script's exclusive privilege. We use raw `git` here:
+# the lease is already acquired and the branch name was validated by
+# state_acquire_lease via _validate_branch.
 if git rev-parse --verify "$task_branch" >/dev/null 2>&1; then
     audit_event "session_boot_warning" "$(jq -cn --arg b "$task_branch" '{reason:"branch_existed_checked_out", branch:$b}')"
     "$SCRIPT_DIR/safe-git" checkout "$task_branch"
 else
-    "$SCRIPT_DIR/safe-git" checkout -b "$task_branch"
+    git checkout -b "$task_branch"
 fi
 
 # Install pre-commit hook

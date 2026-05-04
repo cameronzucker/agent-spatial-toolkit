@@ -274,22 +274,33 @@ case "$subcmd" in
     commit|push|merge|rebase|cherry-pick|am|revert)
         needs_branch_check=1 ;;
     checkout|switch)
-        # Allowed: switching to the lease branch or creating a new branch
-        # whose name we can verify (we err on the side of refusing anything
-        # that would leave the lease branch).
-        # Identify a "target branch" arg (last positional) and refuse if it
-        # isn't the lease branch unless -b/--create flag (creating new branch
-        # is fine, it'll be checked out fresh and tested by pre-commit hook).
-        creates_new=0
+        # Branch creation is REFUSED outright. session_boot.sh creates the
+        # task branch using raw `git`; subagents never have a legitimate
+        # reason to create a new branch via safe-git. Allowing `-b/-B/--create`
+        # let a caller move HEAD to an arbitrary new branch while the lease
+        # still pointed at the original — the subsequent branch check would
+        # then refuse mutating ops on that lease, but only after HEAD had
+        # already escaped (NB1).
+        #
+        # Refuse: -b NAME, -B NAME, --create NAME, --orphan NAME (orphan also
+        # creates a new branch, with the additional sin of detaching from
+        # history).
         target=""
         for a in "${args[@]+"${args[@]}"}"; do
             case "$a" in
-                -b|-B|--create|--orphan) creates_new=1 ;;
+                -b|-B|--create|--orphan)
+                    echo "safe-git: REFUSED — branch creation via '$subcmd $a' is not allowed (session_boot creates branches; subagents must not)" >&2
+                    audit_event "git_refused" "$(jq -cn \
+                        --arg subcmd "$subcmd" \
+                        --arg flag "$a" \
+                        '{subcmd:$subcmd, reason:"checkout-create-off-lease", flag:$flag}')"
+                    exit 4
+                    ;;
                 -*) ;;
                 *) target="$a" ;;
             esac
         done
-        if [[ "$creates_new" -eq 0 && -n "$target" && "$target" != "$lease_branch" ]]; then
+        if [[ -n "$target" && "$target" != "$lease_branch" ]]; then
             echo "safe-git: refusing to checkout '$target' — current lease is on '$lease_branch'" >&2
             audit_event "git_refused" "$(jq -cn \
                 --arg subcmd "$subcmd" \

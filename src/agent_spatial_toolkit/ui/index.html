@@ -21,10 +21,16 @@
 <body>
     <h1>agent-spatial-toolkit — Wizard</h1>
     <main id="wizard">
-        <!-- Spec §3 Phase 2a — upload + EXIF + view labels (wired in 1.D.3). -->
+        <!-- Spec §3 Phase 2a — upload + EXIF + view labels. Wired by app.js. -->
         <section id="phase-2a" class="phase">
             <h2>Phase 2a — Upload and validate</h2>
-            <p class="placeholder">Photo upload, EXIF parsing, and lens/view selection wire up in Task 1.D.3.</p>
+            <div id="phase-2a-thumbnails" class="thumbnail-grid"></div>
+            <div id="phase-2a-drop-zone" class="drop-zone">
+                <p>Drop additional photos here, or
+                    <input type="file" id="phase-2a-file-input" multiple accept="image/*">
+                </p>
+            </div>
+            <button id="phase-2a-next" type="button">Next: declare reference frame →</button>
         </section>
 
         <!-- Spec §3 Phase 2b — reference frame declaration (wired in 1.D.4). -->
@@ -61,5 +67,9 @@
          primitives consumed by the Phase 2a–2f wiring (Tasks 1.D.3–1.D.8).
          Loaded synchronously so window.spatialUI is ready before app.js runs. -->
     <script src="/ui/helpers.js"></script>
+    <!-- Phase wiring (1.D.3 ships Phase 2a; 1.D.4–1.D.8 extend). `defer`
+         delays exec until after DOMContentLoaded, so init() can find the
+         #phase-2a-thumbnails / #phase-2a-next elements without a guard. -->
+    <script src="/ui/app.js" defer></script>
 </body>
 </html>

@@ -79,10 +79,17 @@
             <p id="phase-2c-error" class="error" hidden></p>
         </section>
 
-        <!-- Spec §3 Phase 2d — feature labeling (wired in 1.D.6). -->
+        <!-- Spec §3 Phase 2d — feature labeling. Wired by app.js wirePhase2d
+             (Task 1.D.6 PR-α). One #phase-2d-card per photo (only photos with
+             a solved pose) is appended at runtime. PR-β will add D1 side-by-
+             side + triangulate-on-≥2-clicks; PR-γ will add the D3 ad-hoc
+             dropdown linking. -->
         <section id="phase-2d" class="phase" hidden>
             <h2>Phase 2d — Feature labeling</h2>
-            <p class="placeholder">Feature click + label + /api/feature POST wires up in Task 1.D.6.</p>
+            <p>Click on a photo to capture a feature, then type a label (e.g. "usb_c", "gpio_pin_1"). Each click ray-casts into the part-local frame using the pose you just solved. Only photos with a solved pose appear here.</p>
+            <div id="phase-2d-photos" class="phase-2d-photo-grid"></div>
+            <button id="phase-2d-next" type="button" disabled>Next: validation overlay →</button>
+            <p id="phase-2d-error" class="error" hidden></p>
         </section>
 
         <!-- Spec §3 Phase 2e — validation overlay (wired in 1.D.7). -->

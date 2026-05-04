@@ -341,13 +341,12 @@ def _register_routes(app: Flask) -> None:
         body = request.get_json(silent=True) or {}
         try:
             photo_id = body["photo_id"]
-            intrinsics_dict = body["intrinsics"]
             anchors_list = body["anchors"]
             image_size_in = body["image_size"]
         except (KeyError, TypeError):
             return (
                 jsonify(
-                    {"error": "missing required field (photo_id, intrinsics, anchors, image_size)"}
+                    {"error": "missing required field (photo_id, anchors, image_size)"}
                 ),
                 400,
             )
@@ -358,23 +357,46 @@ def _register_routes(app: Flask) -> None:
             return jsonify({"error": "image_size must be [width, height]"}), 400
 
         try:
-            intrinsics = _intrinsics_from_dict(intrinsics_dict)
-        except (KeyError, TypeError, ValueError) as e:
-            return jsonify({"error": f"invalid intrinsics: {e}"}), 400
-
-        try:
-            world_points = np.array([a["pcb_xyz_mm"] for a in anchors_list], dtype=np.float64)
-            pixel_points = np.array([a["pixel"] for a in anchors_list], dtype=np.float64)
-        except (KeyError, TypeError, ValueError) as e:
-            return jsonify({"error": f"invalid anchor entries: {e}"}), 400
-
-        try:
             image_size = (
                 _coerce_finite_int(image_size_in[0], "image_size[0]"),
                 _coerce_finite_int(image_size_in[1], "image_size[1]"),
             )
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
+
+        # Resolve intrinsics: explicit dict wins; otherwise resolve via lens_id.
+        # The lens_id branch is the new wizard path (Task 1.D.5); the dict path
+        # preserves backward compatibility with existing tests + scripts.
+        intrinsics_dict = body.get("intrinsics")
+        if intrinsics_dict is not None:
+            try:
+                intrinsics = _intrinsics_from_dict(intrinsics_dict)
+            except (KeyError, TypeError, ValueError) as e:
+                return jsonify({"error": f"invalid intrinsics: {e}"}), 400
+        else:
+            lens_id = body.get("lens_id")
+            if not lens_id:
+                return (
+                    jsonify({"error": "must provide either intrinsics or lens_id"}),
+                    400,
+                )
+            from agent_spatial_toolkit.server.lens_catalog import resolve as _resolve_lens
+            intr_obj = _resolve_lens(lens_id, image_size, exif=body.get("exif"))
+            if intr_obj is None:
+                return (
+                    jsonify(
+                        {"error": f"lens_id '{lens_id}' could not resolve to intrinsics; provide an explicit intrinsics dict"}
+                    ),
+                    400,
+                )
+            intrinsics = intr_obj
+            intrinsics_dict = intr_obj.to_dict()  # for the mem["photos"] record below
+
+        try:
+            world_points = np.array([a["pcb_xyz_mm"] for a in anchors_list], dtype=np.float64)
+            pixel_points = np.array([a["pixel"] for a in anchors_list], dtype=np.float64)
+        except (KeyError, TypeError, ValueError) as e:
+            return jsonify({"error": f"invalid anchor entries: {e}"}), 400
 
         try:
             pose = solve_pnp(world_points, pixel_points, intrinsics, image_size)

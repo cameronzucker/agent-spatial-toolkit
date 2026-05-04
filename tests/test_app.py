@@ -524,3 +524,72 @@ def test_lens_catalog_entries_carry_label_and_resolvable_flag(app_factory) -> No
     # Ultrawide → resolvable=False
     assert by_id["pi_camera_module_3_wide"]["resolvable"] is False
     assert by_id["exif:detected"]["resolvable"] is False
+
+
+def _valid_anchors_payload_with_lens_id(image_size: tuple[int, int] = (4608, 2592)) -> dict:
+    """Same shape as _valid_anchors_payload but uses lens_id instead of intrinsics."""
+    base = _valid_anchors_payload(image_size=image_size)
+    base.pop("intrinsics", None)
+    base["lens_id"] = "pi_camera_module_3_standard"
+    base["image_size"] = list(image_size)
+    return base
+
+
+def test_anchors_route_accepts_lens_id_and_resolves_intrinsics(app_factory) -> None:
+    """POST /api/anchors with lens_id resolves intrinsics server-side and solves PnP."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    payload = _valid_anchors_payload_with_lens_id()
+    resp = client.post("/api/anchors", json=payload)
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    assert "pose" in body
+    assert body["pose"]["pose_solver"].startswith("cv2.solvePnP")
+
+
+def test_anchors_route_lens_id_unresolvable_returns_400(app_factory) -> None:
+    """POST /api/anchors with an ultrawide lens_id (unresolvable) returns 400."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    payload = _valid_anchors_payload_with_lens_id()
+    payload["lens_id"] = "pi_camera_module_3_wide"  # ultrawide → resolve() returns None
+    resp = client.post("/api/anchors", json=payload)
+    assert resp.status_code == 400
+    body = resp.get_json()
+    assert "error" in body
+    assert "lens" in body["error"].lower()
+
+
+def test_anchors_route_lens_id_other_without_intrinsics_returns_400(app_factory) -> None:
+    """POST /api/anchors with lens_id='other' and no intrinsics dict returns 400."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    payload = _valid_anchors_payload_with_lens_id()
+    payload["lens_id"] = "other"
+    resp = client.post("/api/anchors", json=payload)
+    assert resp.status_code == 400
+
+
+def test_anchors_route_lens_id_exif_detected_uses_exif(app_factory) -> None:
+    """POST /api/anchors with lens_id='exif:detected' + exif dict resolves intrinsics."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    payload = _valid_anchors_payload_with_lens_id()
+    payload["lens_id"] = "exif:detected"
+    payload["exif"] = {"focalLength35mm": 50.0}
+    resp = client.post("/api/anchors", json=payload)
+    assert resp.status_code == 200, resp.get_json()
+
+
+def test_anchors_route_intrinsics_dict_still_works_backward_compat(app_factory) -> None:
+    """Existing intrinsics-dict path still works (no breaking change)."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    payload = _valid_anchors_payload()
+    resp = client.post("/api/anchors", json=payload)
+    assert resp.status_code == 200, resp.get_json()

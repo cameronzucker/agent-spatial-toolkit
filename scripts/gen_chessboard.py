@@ -12,6 +12,7 @@ Usage:
     #   src/agent_spatial_toolkit/calibration/chessboard_a4.pdf
     #   src/agent_spatial_toolkit/calibration/chessboard_letter.pdf
 """
+
 from pathlib import Path
 
 from reportlab.lib.pagesizes import A4, LETTER
@@ -61,13 +62,22 @@ def draw_chessboard(c: canvas.Canvas, page_w: float, page_h: float, label: str) 
     label_y = y0 - 14 * mm
     c.drawString(x0, label_y, "agent-spatial-toolkit calibration target")
     c.setFont("Helvetica", 9)
-    c.drawString(x0, label_y - 5 * mm,
-                 f"{COLS}×{ROWS} squares ({COLS - 1}×{ROWS - 1} internal corners) · "
-                 f"{int(SQUARE_MM)} mm per square · {label}")
-    c.drawString(x0, label_y - 10 * mm,
-                 "Print at 100% scale (no fit-to-page). Verify a square measures 25 mm with a ruler before use.")
-    c.drawString(x0, label_y - 15 * mm,
-                 "If your printer scales: re-print, or measure actual square size and pass it to the toolkit.")
+    c.drawString(
+        x0,
+        label_y - 5 * mm,
+        f"{COLS}×{ROWS} squares ({COLS - 1}×{ROWS - 1} internal corners) · "
+        f"{int(SQUARE_MM)} mm per square · {label}",
+    )
+    c.drawString(
+        x0,
+        label_y - 10 * mm,
+        "Print at 100% scale (no fit-to-page). Verify a square measures 25 mm with a ruler before use.",
+    )
+    c.drawString(
+        x0,
+        label_y - 15 * mm,
+        "If your printer scales: re-print, or measure actual square size and pass it to the toolkit.",
+    )
 
     # Scale-verification ruler — a 50 mm scale bar
     bar_x = x0

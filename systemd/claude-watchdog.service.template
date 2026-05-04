@@ -24,5 +24,12 @@ StandardError=journal
 # operation; cap it so a runaway tick can't hold the unit forever.
 TimeoutStartSec=15min
 
+# Default KillMode for Type=oneshot is "control-group" — when the main pid
+# exits, systemd kills every other process in the unit's cgroup. The watchdog
+# spawns session_boot via setsid+nohup expecting it to survive the tick;
+# control-group kill defeats that. KillMode=process limits termination to
+# the main pid so detached children survive.
+KillMode=process
+
 [Install]
 WantedBy=default.target

@@ -11,6 +11,7 @@ intrinsics because intrinsics depend on image size (cx, cy, fx all scale
 with the photo's pixel dimensions). Per-request resolution avoids hardcoding
 intrinsics for every possible image resolution.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -84,9 +85,7 @@ def _is_resolvable(lens_id: str, entry: LensCatalogEntry) -> bool:
         return False
     if entry.fallback_focal_35mm_equiv_mm is None:
         return False
-    if resolve_fov_class(entry.fallback_focal_35mm_equiv_mm) == FOV_CLASS_ULTRAWIDE:
-        return False
-    return True
+    return resolve_fov_class(entry.fallback_focal_35mm_equiv_mm) != FOV_CLASS_ULTRAWIDE
 
 
 def list_lens_entries() -> list[dict[str, Any]]:

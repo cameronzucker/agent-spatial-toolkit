@@ -345,9 +345,7 @@ def _register_routes(app: Flask) -> None:
             image_size_in = body["image_size"]
         except (KeyError, TypeError):
             return (
-                jsonify(
-                    {"error": "missing required field (photo_id, anchors, image_size)"}
-                ),
+                jsonify({"error": "missing required field (photo_id, anchors, image_size)"}),
                 400,
             )
 
@@ -381,11 +379,14 @@ def _register_routes(app: Flask) -> None:
                     400,
                 )
             from agent_spatial_toolkit.server.lens_catalog import resolve as _resolve_lens
+
             intr_obj = _resolve_lens(lens_id, image_size, exif=body.get("exif"))
             if intr_obj is None:
                 return (
                     jsonify(
-                        {"error": f"lens_id '{lens_id}' could not resolve to intrinsics; provide an explicit intrinsics dict"}
+                        {
+                            "error": f"lens_id '{lens_id}' could not resolve to intrinsics; provide an explicit intrinsics dict"
+                        }
                     ),
                     400,
                 )

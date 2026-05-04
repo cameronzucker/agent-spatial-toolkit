@@ -1,4 +1,5 @@
 """Tests for server/lens_catalog.py — lens-id → Intrinsics resolution."""
+
 from __future__ import annotations
 
 import pytest

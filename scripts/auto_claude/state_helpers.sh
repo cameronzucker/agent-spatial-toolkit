@@ -44,13 +44,21 @@ _state_lock_path() {
 # _with_state_lock <function> [args...]
 # Runs the given callable while holding an exclusive flock on state.lock.
 # flock(1) is bash-compatible and is released on FD close, so the wrapper
-# opens-and-closes its FD. Reentrancy: bash's flock acquired on the same
-# process holds — sub-shells inheriting the FD share the lock too. We allow
-# reentry by checking AUTO_CLAUDE_STATE_LOCK_HELD.
+# opens-and-closes its FD.
+#
+# Reentrancy (NM1): a previous version honored AUTO_CLAUDE_STATE_LOCK_HELD=1
+# as a marker that "we already hold the lock, skip re-acquiring." But the
+# implementer Claude session inherits this env var, so any subagent could
+# `export AUTO_CLAUDE_STATE_LOCK_HELD=1` and bypass every state-mutation
+# lock. We now gate the reentrancy escape on a PID match: only a caller
+# whose marker value equals THIS process's `$$` is treated as already
+# inside the lock. Crossing a process boundary (subshell, sub-process,
+# inherited env into a `claude` invocation) breaks `$$` equality and forces
+# a real flock.
 _with_state_lock() {
-    if [[ "${AUTO_CLAUDE_STATE_LOCK_HELD:-0}" == "1" ]]; then
-        # Already inside a state-lock critical section; do not re-flock or
-        # we could deadlock on a non-reentrant filesystem.
+    if [[ "${AUTO_CLAUDE_STATE_LOCK_HELD:-}" == "$$" ]]; then
+        # Already inside a state-lock critical section in THIS process; do
+        # not re-flock or we could deadlock on a non-reentrant filesystem.
         "$@"
         return $?
     fi
@@ -62,7 +70,10 @@ _with_state_lock() {
         # Acquire exclusive lock. flock blocks; the watchdog runs at most
         # once per minute so contention is bounded.
         flock -x 9
-        AUTO_CLAUDE_STATE_LOCK_HELD=1
+        # Mark with our PID so a nested call inside the same process can
+        # detect it and skip re-flocking. The subshell inherits the parent's
+        # `$$`, so $$ here equals the parent's PID — exactly what we want.
+        AUTO_CLAUDE_STATE_LOCK_HELD="$$"
         export AUTO_CLAUDE_STATE_LOCK_HELD
         "$@"
     ) 9>"$lp"

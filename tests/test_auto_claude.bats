@@ -305,6 +305,55 @@ JSON
     [[ "$attempts" == "1" ]]
 }
 
+@test "_with_state_lock ignores AUTO_CLAUDE_STATE_LOCK_HELD from a different PID (NM1)" {
+    # NM1: previously the marker was AUTO_CLAUDE_STATE_LOCK_HELD=1, which a
+    # subagent's child process inherits and could use to bypass the flock.
+    # The marker is now "$$" (PID-scoped) — the only legitimate "already
+    # locked" state is when the SAME process is inside the critical section.
+    #
+    # Demonstrating the harm: race N concurrent acquire_lease attempts. If
+    # the env-var bypass were honored from a different PID, multiple
+    # processes would all skip the flock and could race past the
+    # precondition checks. With the PID-scoped marker, every cross-process
+    # caller must re-flock, so exactly one wins.
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"pending","branch":"feat/t","attempts":0,"depends_on":[]}
+  ],
+  "current_lease": null
+}
+JSON
+    local out_dir="$BATS_TEST_TMPDIR/nm1-race"
+    mkdir -p "$out_dir"
+    local i
+    # Each attempt runs in its own subshell with the env-var bypass set —
+    # mimicking a hostile subagent that thinks it can skip flock. With the
+    # PID-scoped check, $$ inside each subshell != "1", so the bypass is
+    # not honored and flock is engaged; exactly one acquires the lease.
+    for i in 1 2 3 4 5; do
+        (
+            export AUTO_CLAUDE_REPO_ROOT="$AUTO_CLAUDE_REPO_ROOT"
+            export AUTO_CLAUDE_STATE_LOCK_HELD=1
+            source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+            if state_acquire_lease "TASK-1" "sess-$i" "feat/t" "deadbeef" >/dev/null 2>&1; then
+                echo "won" > "$out_dir/result-$i"
+            else
+                echo "lost" > "$out_dir/result-$i"
+            fi
+        ) &
+    done
+    wait
+    local wins
+    wins=$(grep -l '^won$' "$out_dir"/result-* 2>/dev/null | wc -l)
+    [[ "$wins" -eq 1 ]]
+    # attempts incremented exactly once (one winner).
+    local attempts
+    attempts=$(jq -r '.tasks[0].attempts' "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json")
+    [[ "$attempts" == "1" ]]
+}
+
 @test "state_acquire_lease rejects task_id with leading dash (M3)" {
     source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
     cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'

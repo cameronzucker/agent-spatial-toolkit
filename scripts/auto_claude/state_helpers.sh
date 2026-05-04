@@ -58,8 +58,17 @@ state_init() {
         echo "state_init: template missing at $example" >&2
         return 1
     fi
-    # Strip the comment, drop the example task, leave a clean ledger.
-    jq 'del(._comment) | .tasks = []' "$example" > "$sp"
+    # Build the canonical state JSON in memory, then write atomically.
+    # Writing directly to $sp would leave a truncated file on a mid-write
+    # crash — every subsequent state_validate would then fail and the
+    # framework would be wedged until manual recovery.
+    local new_json
+    new_json=$(jq 'del(._comment) | .tasks = []' "$example") || {
+        echo "state_init: failed to compose canonical state from $example" >&2
+        return 1
+    }
+    [[ -n "$new_json" ]] || { echo "state_init: empty composition" >&2; return 1; }
+    _state_write "$new_json"
 }
 
 # state_validate [path]

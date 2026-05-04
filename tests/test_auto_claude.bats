@@ -126,6 +126,40 @@ teardown() {
     [[ "$output" == "0" ]]
 }
 
+@test "state_init writes atomically (no partial file on validation failure)" {
+    # B4: state_init must not leave a truncated state.json behind. We force a
+    # failure by pointing at a malformed template; the canonical file must
+    # remain absent (we never partially wrote it).
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    rm -f "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json"
+    # Corrupt the template so jq composition succeeds but schema fails:
+    # set schema_version to a wrong value. _state_write should reject it,
+    # leaving no canonical file behind.
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.example.json" <<'JSON'
+{"schema_version": 999, "tasks": [], "current_lease": null, "_comment": "x"}
+JSON
+    run state_init
+    [[ "$status" -ne 0 ]]
+    # Critical: no half-written canonical file.
+    [[ ! -f "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" ]]
+    # No leftover temp files.
+    run bash -c "ls $AUTO_CLAUDE_REPO_ROOT/.handoff/state.json.tmp.* 2>/dev/null | wc -l"
+    [[ "$output" == "0" ]]
+}
+
+@test "state_init produces a valid file on success" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    rm -f "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json"
+    run state_init
+    [[ "$status" -eq 0 ]]
+    [[ -f "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" ]]
+    run state_validate
+    [[ "$status" -eq 0 ]]
+    # No leftover temp files.
+    run bash -c "ls $AUTO_CLAUDE_REPO_ROOT/.handoff/state.json.tmp.* 2>/dev/null | wc -l"
+    [[ "$output" == "0" ]]
+}
+
 @test "state_validate rejects malformed JSON" {
     source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
     echo "not json" > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json"

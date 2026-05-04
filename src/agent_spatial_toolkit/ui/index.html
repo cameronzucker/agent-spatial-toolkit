@@ -33,10 +33,28 @@
             <button id="phase-2a-next" type="button">Next: declare reference frame →</button>
         </section>
 
-        <!-- Spec §3 Phase 2b — reference frame declaration (wired in 1.D.4). -->
+        <!-- Spec §3 Phase 2b — reference frame declaration. Wired by app.js. -->
         <section id="phase-2b" class="phase" hidden>
             <h2>Phase 2b — Reference frame declaration</h2>
-            <p class="placeholder">Frame preset + known dimensions form wires up in Task 1.D.4.</p>
+            <p>Describe the part-local coordinate frame. The named anchors this produces drive Phase 2c (per-photo clicking).</p>
+            <label class="select-row">
+                <span>Frame preset:</span>
+                <select class="frame-preset" id="phase-2b-preset"></select>
+            </label>
+            <label class="input-row">
+                <span>Long-edge length (mm):</span>
+                <input type="number" class="long-edge-mm" id="phase-2b-long-edge" min="0" step="0.1" placeholder="e.g. 86.5">
+            </label>
+            <label class="input-row">
+                <span>Short-edge length (mm):</span>
+                <input type="number" class="short-edge-mm" id="phase-2b-short-edge" min="0" step="0.1" placeholder="e.g. 84.5">
+            </label>
+            <label class="input-row">
+                <span>Notes (optional, for the agent):</span>
+                <textarea class="frame-notes" id="phase-2b-notes" rows="2"></textarea>
+            </label>
+            <button id="phase-2b-next" type="button">Next: click anchors per photo →</button>
+            <p id="phase-2b-error" class="error" hidden></p>
         </section>
 
         <!-- Spec §3 Phase 2c — per-photo anchors (wired in 1.D.5). -->

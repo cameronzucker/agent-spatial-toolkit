@@ -53,8 +53,35 @@
         { value: 'other', label: 'other' },
     ];
 
+    // Phase 2b frame presets. Spec §3 line 163 describes the canonical
+    // PCB convention as "bottom-left corner with components facing up;
+    // +X along long edge; +Y along short edge toward GPIO header; +Z
+    // away from PCB bottom" — pcb_standard implements that with the
+    // four corners as named anchors. ``custom`` is a sentinel for a
+    // future free-text frame description (spec line 163's "or fill in
+    // free-text alternatives" — the hooks are here but the UI for it
+    // ships in a follow-up).
+    var FRAME_PRESETS = {
+        '': { label: '— Select preset —', anchors: null },
+        'pcb_standard': {
+            label: 'Standard PCB (origin = bottom-left, +X long, +Y short, +Z up)',
+            anchors: function (longMm, shortMm) {
+                return [
+                    { id: 'pcb_corner_origin', xyz: [0, 0, 0] },
+                    { id: 'pcb_corner_x_max', xyz: [longMm, 0, 0] },
+                    { id: 'pcb_corner_y_max', xyz: [0, shortMm, 0] },
+                    { id: 'pcb_corner_xy_max', xyz: [longMm, shortMm, 0] },
+                ];
+            },
+        },
+        'custom': {
+            label: 'Custom (free-text only — anchor input UI ships in a later task)',
+            anchors: null,
+        },
+    };
+
     // Initialize global wizard state. Subsequent phases read this.
-    window.spatialState = window.spatialState || { photos: {} };
+    window.spatialState = window.spatialState || { photos: {}, frame: null };
 
     function init() {
         // Wire phase controls FIRST, independent of /api/state. Without this,
@@ -236,6 +263,11 @@
     }
 
     function wirePhaseControls() {
+        wirePhase2a();
+        wirePhase2b();
+    }
+
+    function wirePhase2a() {
         var nextBtn = document.getElementById('phase-2a-next');
         if (nextBtn) {
             nextBtn.addEventListener('click', function () { advancePhase('2a', '2b'); });
@@ -267,6 +299,73 @@
         var to = document.getElementById('phase-' + toId);
         if (from) from.hidden = true;
         if (to) to.hidden = false;
+    }
+
+    function wirePhase2b() {
+        var presetSelect = document.getElementById('phase-2b-preset');
+        if (presetSelect) {
+            populatePresetOptions(presetSelect);
+        }
+        var nextBtn = document.getElementById('phase-2b-next');
+        if (!nextBtn) return;
+        nextBtn.addEventListener('click', function () {
+            var error = commitFrameAndAdvance();
+            var errorEl = document.getElementById('phase-2b-error');
+            if (error) {
+                if (errorEl) {
+                    errorEl.textContent = error;
+                    errorEl.hidden = false;
+                }
+                return;
+            }
+            if (errorEl) errorEl.hidden = true;
+            advancePhase('2b', '2c');
+        });
+    }
+
+    function populatePresetOptions(select) {
+        Object.keys(FRAME_PRESETS).forEach(function (key) {
+            var opt = document.createElement('option');
+            opt.value = key;
+            opt.textContent = FRAME_PRESETS[key].label;
+            select.appendChild(opt);
+        });
+    }
+
+    // Returns null on success (anchors committed to spatialState.frame),
+    // or a human-readable error string. Validation is intentionally light —
+    // the backend re-validates dimensions when /api/anchors is POSTed in
+    // Phase 2c — but we want the user to see "fix this here" rather than
+    // a back-button trip from a 400 response later.
+    function commitFrameAndAdvance() {
+        var preset = (document.getElementById('phase-2b-preset') || {}).value || '';
+        var longMm = parseFloat((document.getElementById('phase-2b-long-edge') || {}).value);
+        var shortMm = parseFloat((document.getElementById('phase-2b-short-edge') || {}).value);
+        var notes = (document.getElementById('phase-2b-notes') || {}).value || '';
+
+        if (!preset || preset === '') {
+            return 'Pick a frame preset before continuing.';
+        }
+        if (!isFinite(longMm) || longMm <= 0) {
+            return 'Enter a positive long-edge length in millimeters.';
+        }
+        if (!isFinite(shortMm) || shortMm <= 0) {
+            return 'Enter a positive short-edge length in millimeters.';
+        }
+
+        var presetDef = FRAME_PRESETS[preset];
+        var anchors = presetDef && presetDef.anchors
+            ? presetDef.anchors(longMm, shortMm)
+            : [];
+
+        window.spatialState.frame = {
+            preset: preset,
+            longMm: longMm,
+            shortMm: shortMm,
+            notes: notes,
+            anchors: anchors,
+        };
+        return null;
     }
 
     if (document.readyState === 'loading') {

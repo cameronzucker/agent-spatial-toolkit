@@ -231,23 +231,21 @@ def test_phase_2c_anchor_click_flow_happy_path(
             timeout=15_000,
         )
         result_text = result_locator.text_content() or ""
-        # Either solved cleanly OR returned a clear failure that the UI surfaced.
-        # Both paths prove the round-trip works. The success path includes
-        # "Pose solved" + "intrinsics_suspect"; the failure path starts with
-        # "Solve failed:". The test accepts EITHER but flags if neither appears
-        # (which would mean the result area was filled with something unexpected).
-        assert "Pose solved" in result_text or "Solve failed" in result_text, (
-            f"Unexpected result text: {result_text!r}"
-        )
+        # Require the success path: 4 anchors at known PCB corners + a
+        # resolvable lens (pi_camera_module_3_standard) MUST produce a pose.
+        # If the result is "Solve failed", something regressed in the
+        # POST /api/anchors round-trip — fail the test. (Earlier draft of
+        # this test accepted either outcome; tightened per cross-model
+        # review feedback.)
+        assert "Pose solved" in result_text, f"Expected 'Pose solved'; got: {result_text!r}"
 
-        # If the solve succeeded, Next should now be enabled.
+        # Next button must enable after a successful solve.
         next_btn = page.locator("#phase-2c-next")
-        if "Pose solved" in result_text:
-            page.wait_for_function(
-                "el => el && !el.disabled",
-                arg=next_btn.element_handle(),
-                timeout=5_000,
-            )
+        page.wait_for_function(
+            "el => el && !el.disabled",
+            arg=next_btn.element_handle(),
+            timeout=5_000,
+        )
     finally:
         if url is not None:
             best_effort_finalize(url)

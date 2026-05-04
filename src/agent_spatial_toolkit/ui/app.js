@@ -255,7 +255,12 @@
     // the placeholder LENS_OPTIONS list. The user can still override by
     // picking a different option.
     function maybeAutoSelectLens(photo, card, exif) {
-        if (!exif || (!exif.make && !exif.model && !exif.lensModel)) return;
+        if (!exif) return;
+        // Only auto-select 'exif:detected' if EXIF carries focalLength35mm —
+        // that's the field the server's lens_catalog.resolve('exif:detected')
+        // requires. EXIF with only Make/Model/LensModel but no focal length
+        // would auto-select a path guaranteed to 400 at Solve time.
+        if (exif.focalLength35mm == null) return;
         var select = card.querySelector('select.lens-select');
         if (!select) return;
         var detectedValue = 'exif:detected';

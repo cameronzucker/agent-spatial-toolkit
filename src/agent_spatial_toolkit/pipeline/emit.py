@@ -100,6 +100,10 @@ def emit_annotations(state: SessionState, session_dir: Path) -> Path:
     data = ann.to_dict()
     validate_annotations(data)  # raises ValidationError if flags are invalid
 
+    # Atomic write: emit to tmp, fsync(?), then atomic rename. This makes
+    # annotations.json either complete or absent — never truncated.
     out_path = session_dir / "annotations.json"
-    out_path.write_text(json.dumps(data, indent=2))
+    tmp_path = out_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(out_path)
     return out_path

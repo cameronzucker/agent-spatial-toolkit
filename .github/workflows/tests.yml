@@ -43,4 +43,5 @@ jobs:
           exit $status
       - name: Run linter
         run: uv run ruff check .
-        continue-on-error: true
+      - name: Check formatting
+        run: uv run ruff format --check .

@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+# state_helpers.sh — sourced library for reading/writing .handoff/state.json.
+#
+# state.json is the SINGLE source of truth for task state. All writes go
+# through these helpers so we maintain:
+#   - atomic mv-based writes
+#   - schema validation on every write
+#   - lease-ownership checks (a script that doesn't hold the current lease
+#     cannot mutate task state for the leased task)
+#
+# Functions:
+#   state_path                       -> prints absolute path
+#   state_init                       -> create from template if missing
+#   state_validate [path]            -> exit nonzero if malformed
+#   state_get_task <id>              -> jq -c on one task
+#   state_get_next_pending           -> jq -c on next eligible task or null
+#   state_set_task_status <id> <s>   -> mutate status, bump updated_at
+#   state_set_task_phase <id> <p>    -> mutate phase, bump updated_at
+#   state_set_task_pr <id> <num> <url> -> record PR
+#   state_acquire_lease <id> <session_id> <branch> <head_sha>
+#   state_release_lease <id> <session_id> <final_status>
+#   state_get_current_lease          -> jq on current_lease (null if none)
+
+if [[ -z "${AUTO_CLAUDE_REPO_ROOT:-}" ]]; then
+    _state_self="${BASH_SOURCE[0]}"
+    AUTO_CLAUDE_REPO_ROOT="$(cd "$(dirname "$_state_self")/../.." && pwd)"
+    export AUTO_CLAUDE_REPO_ROOT
+fi
+
+state_path() {
+    printf '%s\n' "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json"
+}
+
+# Internal: write JSON atomically to state.json after schema validation.
+_state_write() {
+    local new_json="$1"
+    local sp
+    sp="$(state_path)"
+    local tmp
+    tmp="$(mktemp "${sp}.tmp.XXXXXX")"
+    printf '%s\n' "$new_json" > "$tmp"
+    if ! state_validate "$tmp"; then
+        rm -f "$tmp"
+        echo "_state_write: refusing to write — schema validation failed" >&2
+        return 1
+    fi
+    mv "$tmp" "$sp"
+}
+
+state_init() {
+    local sp
+    sp="$(state_path)"
+    if [[ -f "$sp" ]]; then
+        return 0
+    fi
+    local example="$AUTO_CLAUDE_REPO_ROOT/.handoff/state.example.json"
+    if [[ ! -f "$example" ]]; then
+        echo "state_init: template missing at $example" >&2
+        return 1
+    fi
+    # Strip the comment, drop the example task, leave a clean ledger.
+    jq 'del(._comment) | .tasks = []' "$example" > "$sp"
+}
+
+# state_validate [path]
+# Validates schema invariants. Path defaults to state.json. Returns nonzero on
+# violation; emits human-readable error on stderr.
+state_validate() {
+    local path="${1:-$(state_path)}"
+    [[ -f "$path" ]] || { echo "state_validate: $path missing" >&2; return 1; }
+
+    # 1. parseable JSON
+    if ! jq -e . "$path" >/dev/null 2>&1; then
+        echo "state_validate: $path is not valid JSON" >&2
+        return 2
+    fi
+
+    # 2. required top-level keys + types. Use a single jq script so we get one
+    #    pass; it returns "ok" or a list of failures.
+    local report
+    report=$(jq -r '
+        def fail(msg): "FAIL: " + msg;
+        [
+            (if .schema_version == 1 then empty else fail("schema_version != 1") end),
+            (if (.tasks | type) == "array" then empty else fail("tasks must be array") end),
+            (if (.current_lease == null or (.current_lease | type) == "object")
+                then empty else fail("current_lease must be null or object") end),
+            (.tasks | to_entries[] | .key as $i | .value as $t |
+                (if ($t.id | type) == "string" then empty
+                    else fail("tasks[\($i)].id must be string") end),
+                (if ($t.status // "") | IN("pending","leased","in_progress","pr_open","blocked","done")
+                    then empty else fail("tasks[\($i)].status invalid: \($t.status)") end),
+                (if ($t.branch | type) == "string" then empty
+                    else fail("tasks[\($i)].branch must be string") end),
+                (if ($t.attempts // 0) | type == "number" then empty
+                    else fail("tasks[\($i)].attempts must be number") end),
+                (if ($t.depends_on // []) | type == "array" then empty
+                    else fail("tasks[\($i)].depends_on must be array") end)
+            )
+        ] | if length == 0 then "ok" else .[] end
+    ' "$path" 2>&1)
+
+    if [[ "$report" != "ok" ]]; then
+        echo "state_validate: $report" >&2
+        return 3
+    fi
+
+    # 3. unique task ids
+    local dupe
+    dupe=$(jq -r '[.tasks[].id] | group_by(.)[] | select(length>1) | .[0]' "$path")
+    if [[ -n "$dupe" ]]; then
+        echo "state_validate: duplicate task id: $dupe" >&2
+        return 4
+    fi
+
+    return 0
+}
+
+state_get_task() {
+    local id="$1"
+    jq -c --arg id "$id" '.tasks[] | select(.id == $id)' "$(state_path)"
+}
+
+# state_get_next_pending — first task that is pending and whose deps are all done.
+state_get_next_pending() {
+    jq -c '
+        . as $root |
+        [.tasks[] | select(.status == "pending")] as $pending |
+        ($pending[] | . as $t |
+            ($t.depends_on // []) as $deps |
+            if ($deps | length) == 0 then $t
+            else
+                (
+                    [$deps[] as $d | $root.tasks[] | select(.id == $d) | .status] as $dep_statuses |
+                    if ($dep_statuses | length) == ($deps | length) and (all($dep_statuses[]; . == "done"))
+                    then $t else empty end
+                )
+            end
+        ) | . // null
+    ' "$(state_path)" | head -1
+}
+
+state_get_current_lease() {
+    jq -c '.current_lease // null' "$(state_path)"
+}
+
+# Internal helper: mutate the task at id via a jq filter applied to that task,
+# then write back. The filter must be a valid jq expression that operates on
+# the task object (referenced as `.`).
+_state_mutate_task() {
+    local id="$1"
+    local filter="$2"
+    local sp
+    sp="$(state_path)"
+    local now
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    local new_json
+    new_json=$(jq --arg id "$id" --arg now "$now" \
+        '.tasks |= map(if .id == $id then ('"$filter"') | .updated_at = $now else . end)' \
+        "$sp")
+    [[ -n "$new_json" ]] || { echo "_state_mutate_task: empty result" >&2; return 1; }
+    _state_write "$new_json"
+}
+
+state_set_task_status() {
+    local id="$1"
+    local status="$2"
+    case "$status" in
+        pending|leased|in_progress|pr_open|blocked|done) ;;
+        *) echo "state_set_task_status: invalid status '$status'" >&2; return 1 ;;
+    esac
+    _state_mutate_task "$id" ".status = \"$status\""
+}
+
+state_set_task_phase() {
+    local id="$1"
+    local phase="$2"
+    _state_mutate_task "$id" ".phase = \"$phase\""
+}
+
+state_set_task_pr() {
+    local id="$1"
+    local pr_number="$2"
+    local pr_url="$3"
+    _state_mutate_task "$id" \
+        ".pr_number = $pr_number | .pr_url = \"$pr_url\" | .status = \"pr_open\""
+}
+
+# state_acquire_lease <task_id> <session_id> <branch> <head_sha>
+# Atomic-ish: validates that the task is currently pending and there's no
+# competing lease, then writes the lease + flips status.
+state_acquire_lease() {
+    local id="$1"
+    local session_id="$2"
+    local branch="$3"
+    local head_sha="$4"
+    local cwd_root="${AUTO_CLAUDE_REPO_ROOT}"
+    local now
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    local sp
+    sp="$(state_path)"
+
+    # Pre-flight: task is pending, no current lease, branch matches.
+    local current_status current_lease
+    current_status=$(jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .status // "missing"' "$sp")
+    if [[ -z "$current_status" || "$current_status" == "missing" ]]; then
+        echo "state_acquire_lease: task $id not found" >&2
+        return 1
+    fi
+    if [[ "$current_status" != "pending" ]]; then
+        echo "state_acquire_lease: task $id is $current_status, not pending" >&2
+        return 2
+    fi
+    current_lease=$(jq -r '.current_lease // empty' "$sp")
+    if [[ -n "$current_lease" ]]; then
+        echo "state_acquire_lease: another lease is active" >&2
+        return 3
+    fi
+
+    local new_json
+    new_json=$(jq \
+        --arg id "$id" \
+        --arg session_id "$session_id" \
+        --arg branch "$branch" \
+        --arg head_sha "$head_sha" \
+        --arg cwd_root "$cwd_root" \
+        --arg now "$now" \
+        '
+        .tasks |= map(
+            if .id == $id then
+                .status = "leased"
+                | .head_sha_at_lease_start = $head_sha
+                | .phase = "leased"
+                | .updated_at = $now
+                | .attempts = (.attempts // 0) + 1
+            else . end
+        )
+        | .current_lease = {
+            task_id: $id,
+            session_id: $session_id,
+            branch: $branch,
+            head_sha_at_lease_start: $head_sha,
+            cwd_root: $cwd_root,
+            acquired_at: $now
+        }
+        | .last_session_id = $session_id
+        ' "$sp")
+    _state_write "$new_json"
+}
+
+# state_release_lease <task_id> <session_id> <final_status>
+# Verifies the lease belongs to this session before clearing.
+state_release_lease() {
+    local id="$1"
+    local session_id="$2"
+    local final_status="$3"
+    case "$final_status" in
+        pending|pr_open|blocked|done) ;;
+        *) echo "state_release_lease: invalid final_status '$final_status'" >&2; return 1 ;;
+    esac
+
+    local sp
+    sp="$(state_path)"
+    local owner
+    owner=$(jq -r '.current_lease.session_id // empty' "$sp")
+    if [[ "$owner" != "$session_id" ]]; then
+        echo "state_release_lease: lease owned by '$owner', not '$session_id'" >&2
+        return 2
+    fi
+
+    local now
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    local new_json
+    new_json=$(jq \
+        --arg id "$id" \
+        --arg final_status "$final_status" \
+        --arg now "$now" \
+        '
+        .tasks |= map(
+            if .id == $id then
+                .status = $final_status
+                | .updated_at = $now
+                | .phase = (if $final_status == "done" or $final_status == "pr_open"
+                            then "done"
+                            else .phase end)
+            else . end
+        )
+        | .current_lease = null
+        ' "$sp")
+    _state_write "$new_json"
+}
+
+# Refuse a write if the caller's session is not the lease owner. Used by any
+# helper that mutates a leased task. id is optional; if omitted, asserts on
+# whatever the current lease is.
+state_assert_lease_owner() {
+    local session_id="$1"
+    local id="${2:-}"
+    local sp
+    sp="$(state_path)"
+    local owner_session owner_task
+    owner_session=$(jq -r '.current_lease.session_id // empty' "$sp")
+    owner_task=$(jq -r '.current_lease.task_id // empty' "$sp")
+    if [[ -z "$owner_session" ]]; then
+        echo "state_assert_lease_owner: no lease held; refusing write" >&2
+        return 1
+    fi
+    if [[ "$owner_session" != "$session_id" ]]; then
+        echo "state_assert_lease_owner: lease owned by '$owner_session', not '$session_id'" >&2
+        return 2
+    fi
+    if [[ -n "$id" && "$owner_task" != "$id" ]]; then
+        echo "state_assert_lease_owner: lease is on '$owner_task', not '$id'" >&2
+        return 3
+    fi
+    return 0
+}

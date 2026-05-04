@@ -25,7 +25,6 @@ NOT inspect the resulting annotations.json. This test does both.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import threading
 import time
@@ -36,27 +35,9 @@ from typing import Any
 
 import pytest
 
+from tests.lifecycle_helpers import best_effort_finalize, scrape_url_from_capfd
+
 FIXTURES = Path(__file__).parent / "fixtures/synthetic_card"
-
-
-def _scrape_url_from_capfd(capfd: pytest.CaptureFixture[str], timeout_s: float = 5.0) -> str:
-    """Poll captured stdout for the ``Open <url> ...`` line printed by cli._annotate.
-
-    capfd (file-descriptor capture) is required: the CLI runs in a
-    background thread and writes via flush=True; pytest's default ``capsys``
-    misses cross-thread writes.
-    """
-    deadline = time.monotonic() + timeout_s
-    accumulated = ""
-    while time.monotonic() < deadline:
-        captured = capfd.readouterr()
-        accumulated += captured.out
-        if "http://" in accumulated:
-            for word in accumulated.split():
-                if word.startswith("http://"):
-                    return word.rstrip(".,")
-        time.sleep(0.05)
-    raise AssertionError(f"CLI did not print server URL within {timeout_s}s; got: {accumulated!r}")
 
 
 def _http_post_json(url: str, body: dict[str, Any], timeout_s: float = 5.0) -> dict[str, Any]:
@@ -94,22 +75,6 @@ def _retry_get_json(url: str, deadline_s: float = 5.0) -> dict[str, Any]:
     raise AssertionError(
         f"GET {url} never succeeded within {deadline_s}s; last error: {last_exc!r}"
     )
-
-
-def _best_effort_finalize(url: str, timeout_s: float = 2.0) -> None:
-    """Trigger /api/finalize, suppressing all errors. Used in test cleanup
-    paths to ensure a mid-test failure doesn't leak the lifecycle server's
-    bound port + daemon thread into downstream tests in the same session.
-    """
-    with contextlib.suppress(Exception):
-        req = urllib.request.Request(
-            f"{url.rstrip('/')}/api/finalize",
-            data=b"{}",
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            resp.read()
 
 
 def test_cli_synthetic_card_recovers_features_to_within_1mm(
@@ -174,7 +139,7 @@ def test_cli_synthetic_card_recovers_features_to_within_1mm(
     session_dir: Path | None = None
 
     try:
-        url = _scrape_url_from_capfd(capfd)
+        url = scrape_url_from_capfd(capfd)
 
         # Resolve the live session_dir via /api/state. _retry_get_json
         # handles the brief window between "URL printed" and "socket
@@ -266,7 +231,7 @@ def test_cli_synthetic_card_recovers_features_to_within_1mm(
         # daemon thread don't leak into downstream tests in the same
         # pytest session. Errors are swallowed; the test is already failing.
         if cli_thread.is_alive() and url is not None:
-            _best_effort_finalize(url)
+            best_effort_finalize(url)
             cli_thread.join(timeout=10.0)
 
     assert session_dir is not None, "session_dir was never resolved"

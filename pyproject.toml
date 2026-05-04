@@ -1,0 +1,27 @@
+[project]
+name = "agent-spatial-toolkit"
+version = "0.0.1"
+description = "Convert reference photos of physical components into structured spatial data for LLM agents."
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Cameron Zucker"},
+]
+requires-python = ">=3.10"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "reportlab>=4.5.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_spatial_toolkit"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/agent_spatial_toolkit/calibration/chessboard_a4.pdf" = "agent_spatial_toolkit/calibration/chessboard_a4.pdf"
+"src/agent_spatial_toolkit/calibration/chessboard_letter.pdf" = "agent_spatial_toolkit/calibration/chessboard_letter.pdf"

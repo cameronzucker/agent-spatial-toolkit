@@ -25,9 +25,11 @@ NOT inspect the resulting annotations.json. This test does both.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -75,6 +77,39 @@ def _http_get_json(url: str, timeout_s: float = 5.0) -> dict[str, Any]:
     with urllib.request.urlopen(url, timeout=timeout_s) as resp:
         assert resp.status == 200, f"GET {url} returned {resp.status}"
         return json.loads(resp.read().decode("utf-8"))
+
+
+def _retry_get_json(url: str, deadline_s: float = 5.0) -> dict[str, Any]:
+    """GET-with-retry — handles the brief window where the URL is printed
+    before the WSGI listener has fully bound the socket on slow CI.
+    """
+    deadline = time.monotonic() + deadline_s
+    last_exc: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            return _http_get_json(url, timeout_s=2.0)
+        except (ConnectionRefusedError, urllib.error.URLError, OSError) as e:
+            last_exc = e
+            time.sleep(0.05)
+    raise AssertionError(
+        f"GET {url} never succeeded within {deadline_s}s; last error: {last_exc!r}"
+    )
+
+
+def _best_effort_finalize(url: str, timeout_s: float = 2.0) -> None:
+    """Trigger /api/finalize, suppressing all errors. Used in test cleanup
+    paths to ensure a mid-test failure doesn't leak the lifecycle server's
+    bound port + daemon thread into downstream tests in the same session.
+    """
+    with contextlib.suppress(Exception):
+        req = urllib.request.Request(
+            f"{url.rstrip('/')}/api/finalize",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            resp.read()
 
 
 def test_cli_synthetic_card_recovers_features_to_within_1mm(
@@ -131,19 +166,34 @@ def test_cli_synthetic_card_recovers_features_to_within_1mm(
     cli_thread = threading.Thread(target=_run_cli, daemon=True)
     cli_thread.start()
 
+    # Bind these before the try-block so the finally cleanup and the
+    # post-block artifact-verification are robust to mid-flow failures
+    # (e.g. URL scrape raising would otherwise leave session_dir undefined
+    # and mask the real failure with UnboundLocalError).
+    url: str | None = None
+    session_dir: Path | None = None
+
     try:
         url = _scrape_url_from_capfd(capfd)
 
-        # Resolve the live session_dir via /api/state — the CLI mints a
-        # timestamped subdirectory under --out, so we don't know its name.
-        state = _http_get_json(f"{url.rstrip('/')}/api/state")
+        # Resolve the live session_dir via /api/state. _retry_get_json
+        # handles the brief window between "URL printed" and "socket
+        # accept()ing" on slow CI runners.
+        state = _retry_get_json(f"{url.rstrip('/')}/api/state")
         session_dir = Path(state["session_dir"])
         assert session_dir.is_dir()
+
+        # Manifest contract (spec §6 session_artifacts.manifest): every photo
+        # entry carries sha256, path, and size_bytes — assert all three so
+        # a regression that drops any of them surfaces here.
         assert (session_dir / "manifest.json").is_file(), "CLI must have written manifest.json"
         manifest = json.loads((session_dir / "manifest.json").read_text(encoding="utf-8"))
         assert photo_basename in manifest, "manifest should index the copied photo"
         expected_sha = manifest[photo_basename]["sha256"]
         assert len(expected_sha) == 64
+        assert manifest[photo_basename]["path"] == f"photos/{photo_basename}"
+        actual_size = (session_dir / "photos" / photo_basename).stat().st_size
+        assert manifest[photo_basename]["size_bytes"] == actual_size
 
         # Build the orthographic intrinsics dict — same recipe as
         # test_smoke_synthetic.py, in the wire-format shape /api/anchors
@@ -197,8 +247,11 @@ def test_cli_synthetic_card_recovers_features_to_within_1mm(
 
         finalize_resp = _http_post_json(f"{url.rstrip('/')}/api/finalize", {})
         assert finalize_resp["status"] == "done"
-        annotations_path = Path(finalize_resp["annotations_path"])
-        assert annotations_path == session_dir / "annotations.json"
+        # Compare resolved paths so the assertion is symlink-/relative-form-tolerant.
+        assert (
+            Path(finalize_resp["annotations_path"]).resolve()
+            == (session_dir / "annotations.json").resolve()
+        )
 
         # The CLI thread should exit once the lifecycle's serve_thread joins
         # (triggered by the async shutdown scheduled in /api/finalize).
@@ -206,14 +259,39 @@ def test_cli_synthetic_card_recovers_features_to_within_1mm(
         assert not cli_thread.is_alive(), "CLI thread did not exit after /api/finalize"
         assert cli_result["code"] == 0
     finally:
+        # Restore the patched module attribute first so a re-run starts clean.
         cli.start_server = orig_start_server  # type: ignore[assignment]
+        # If an assertion failed mid-flow, the lifecycle server is still
+        # running — trigger a best-effort shutdown so the bound port and
+        # daemon thread don't leak into downstream tests in the same
+        # pytest session. Errors are swallowed; the test is already failing.
+        if cli_thread.is_alive() and url is not None:
+            _best_effort_finalize(url)
+            cli_thread.join(timeout=10.0)
 
+    assert session_dir is not None, "session_dir was never resolved"
     # ─── Verify the emitted artifacts ─────────────────────────────────────
     annotations = json.loads((session_dir / "annotations.json").read_text(encoding="utf-8"))
 
-    # status.json is a separate, agent-pollable terminal marker (spec §3).
+    # status.json is a separate, agent-pollable terminal marker (spec §3
+    # line 122/129). Strict equality is correct — the spec defines exactly
+    # one field with exactly one value at terminal state.
     status = json.loads((session_dir / "status.json").read_text(encoding="utf-8"))
     assert status == {"status": "done"}
+
+    # Schema envelope (spec §6) — assert presence + correct shape of every
+    # top-level key so a regression that drops any of them surfaces here
+    # rather than getting smuggled past as a partial-pass.
+    assert annotations["schema_version"] == 1
+    assert isinstance(annotations["toolkit_version"], str) and annotations["toolkit_version"]
+    assert isinstance(annotations["generated_at"], str) and annotations["generated_at"]
+    assert isinstance(annotations["reference_frame"], dict)
+    assert annotations["reference_frame"]["units"] == "mm"
+    # session_artifacts wires the sibling-file names back into the canonical
+    # artifact (spec §6 session_artifacts block) so a downstream consumer
+    # knows which files form the complete bundle.
+    assert annotations["session_artifacts"]["events_jsonl"] == "events.jsonl"
+    assert annotations["session_artifacts"]["manifest"] == "manifest.json"
 
     # Photos: exactly one, with the manifest-derived sha256 plumbed through.
     assert len(annotations["photos"]) == 1
@@ -223,15 +301,19 @@ def test_cli_synthetic_card_recovers_features_to_within_1mm(
     assert emitted_photo["path"] == f"photos/{photo_basename}"
 
     # Features: each ground-truth feature should appear with its part-local
-    # XY recovered to within 1 mm. Z is the assumed plane (0).
+    # XY recovered to within 1 mm. Z is the assumed plane (0). Method must
+    # be the β-mode marker per spec §5.1 — guards against a silent regression
+    # to "triangulation" or some other string.
     emitted_by_id = {f["id"]: f for f in annotations["features"]}
     assert set(emitted_by_id) == {f["id"] for f in expected["features"]}
     for feat in expected["features"]:
         true_xy = feat["pcb_xyz_mm"]
-        emitted_xy = emitted_by_id[feat["id"]]["pcb_xyz_mm"]
+        emitted = emitted_by_id[feat["id"]]
+        emitted_xy = emitted["pcb_xyz_mm"]
         assert abs(emitted_xy[0] - true_xy[0]) < 1.0, f"emit X mismatch for {feat['id']}"
         assert abs(emitted_xy[1] - true_xy[1]) < 1.0, f"emit Y mismatch for {feat['id']}"
         assert emitted_xy[2] == 0.0
+        assert emitted["measurements"]["method"] == "planar_intersection"
 
     # Closed-enum flags: spec §6 line 458 — the server auto-emits
     # feature_clicked_only_once:<id> for every β-mode feature. Per the
@@ -242,6 +324,11 @@ def test_cli_synthetic_card_recovers_features_to_within_1mm(
         assert f"feature_clicked_only_once:{feat['id']}" in flags, (
             f"missing closed-enum flag for {feat['id']}"
         )
+    # Negative assertions: the synthetic card pose succeeds with anchor
+    # RMS << 5 px, so the suspect-intrinsics flags MUST NOT appear.
+    # Spurious emission would itself be a regression.
+    assert "intrinsics_suspect_high_anchor_rms" not in flags
+    assert "intrinsics_session_recommend_chessboard" not in flags
 
     # quality_summary counts: 5 β-mode features ⇒ z_assumed_count=5,
     # triangulated_count=0 (γ-mode is deferred to v0.1.0).

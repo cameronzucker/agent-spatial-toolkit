@@ -31,6 +31,84 @@ state_path() {
     printf '%s\n' "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json"
 }
 
+# Path of the cross-process lock that serializes state-mutating callers.
+# Held with an exclusive flock for the duration of any read-check-write
+# sequence (state_init / state_acquire_lease / state_release_lease /
+# state_set_task_*). The session lock that gates which process is "the
+# implementer" is a different lock; this one is purely for serializing
+# state.json writes between any two processes that might race.
+_state_lock_path() {
+    printf '%s\n' "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.lock"
+}
+
+# _with_state_lock <function> [args...]
+# Runs the given callable while holding an exclusive flock on state.lock.
+# flock(1) is bash-compatible and is released on FD close, so the wrapper
+# opens-and-closes its FD. Reentrancy: bash's flock acquired on the same
+# process holds — sub-shells inheriting the FD share the lock too. We allow
+# reentry by checking AUTO_CLAUDE_STATE_LOCK_HELD.
+_with_state_lock() {
+    if [[ "${AUTO_CLAUDE_STATE_LOCK_HELD:-0}" == "1" ]]; then
+        # Already inside a state-lock critical section; do not re-flock or
+        # we could deadlock on a non-reentrant filesystem.
+        "$@"
+        return $?
+    fi
+    local lp
+    lp="$(_state_lock_path)"
+    mkdir -p "$(dirname "$lp")"
+    : > /dev/null  # noop; ensure $? clean before flock
+    (
+        # Acquire exclusive lock. flock blocks; the watchdog runs at most
+        # once per minute so contention is bounded.
+        flock -x 9
+        AUTO_CLAUDE_STATE_LOCK_HELD=1
+        export AUTO_CLAUDE_STATE_LOCK_HELD
+        "$@"
+    ) 9>"$lp"
+}
+
+# Validate a task_id: uppercase letters, digits, `_`, `-`; starts with letter;
+# 1..64 chars. Refuses leading dashes (which break git as a positional arg)
+# and refuses anything containing shell or path metacharacters.
+_validate_task_id() {
+    local id="$1"
+    if [[ ! "$id" =~ ^[A-Z][A-Z0-9_-]{0,63}$ ]]; then
+        echo "validate_task_id: rejected '$id' (must match ^[A-Z][A-Z0-9_-]{0,63}\$)" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Validate a branch name. Defers to git's own check-ref-format (which knows
+# about all the bizarre rules — no `..`, no trailing `/`, no `@{`, etc.) and
+# additionally refuses leading dashes (which break `git checkout -b`) and
+# `--` anywhere (option-eaten by various git subcommands).
+_validate_branch() {
+    local branch="$1"
+    if [[ -z "$branch" ]]; then
+        echo "validate_branch: empty branch name" >&2
+        return 1
+    fi
+    case "$branch" in
+        -*)
+            echo "validate_branch: rejected '$branch' (leading dash)" >&2
+            return 1 ;;
+        *' '*)
+            echo "validate_branch: rejected '$branch' (embedded space)" >&2
+            return 1 ;;
+        *'..'*)
+            echo "validate_branch: rejected '$branch' (embedded dotdot)" >&2
+            return 1 ;;
+    esac
+    # Ask git itself. Suppresses output; only the exit code matters.
+    if ! git check-ref-format --branch "$branch" >/dev/null 2>&1; then
+        echo "validate_branch: rejected '$branch' (git check-ref-format failed)" >&2
+        return 1
+    fi
+    return 0
+}
+
 # Internal: write JSON atomically to state.json after schema validation.
 _state_write() {
     local new_json="$1"
@@ -47,7 +125,7 @@ _state_write() {
     mv "$tmp" "$sp"
 }
 
-state_init() {
+_state_init_locked() {
     local sp
     sp="$(state_path)"
     if [[ -f "$sp" ]]; then
@@ -69,6 +147,10 @@ state_init() {
     }
     [[ -n "$new_json" ]] || { echo "state_init: empty composition" >&2; return 1; }
     _state_write "$new_json"
+}
+
+state_init() {
+    _with_state_lock _state_init_locked
 }
 
 # state_validate [path]
@@ -159,13 +241,9 @@ state_get_current_lease() {
 # code that calls these wrappers) cannot corrupt the filter or trigger
 # arbitrary jq expression evaluation against state.json.
 
-state_set_task_status() {
+_state_set_task_status_locked() {
     local id="$1"
     local status="$2"
-    case "$status" in
-        pending|leased|in_progress|pr_open|blocked|done) ;;
-        *) echo "state_set_task_status: invalid status '$status'" >&2; return 1 ;;
-    esac
     local sp now new_json
     sp="$(state_path)"
     now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -176,6 +254,32 @@ state_set_task_status() {
         '.tasks |= map(if .id == $id then .status = $status | .updated_at = $now else . end)' \
         "$sp") || return 1
     [[ -n "$new_json" ]] || { echo "state_set_task_status: empty result" >&2; return 1; }
+    _state_write "$new_json"
+}
+
+state_set_task_status() {
+    local id="$1"
+    local status="$2"
+    case "$status" in
+        pending|leased|in_progress|pr_open|blocked|done) ;;
+        *) echo "state_set_task_status: invalid status '$status'" >&2; return 1 ;;
+    esac
+    _with_state_lock _state_set_task_status_locked "$id" "$status"
+}
+
+_state_set_task_phase_locked() {
+    local id="$1"
+    local phase="$2"
+    local sp now new_json
+    sp="$(state_path)"
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    new_json=$(jq \
+        --arg id "$id" \
+        --arg phase "$phase" \
+        --arg now "$now" \
+        '.tasks |= map(if .id == $id then .phase = $phase | .updated_at = $now else . end)' \
+        "$sp") || return 1
+    [[ -n "$new_json" ]] || { echo "state_set_task_phase: empty result" >&2; return 1; }
     _state_write "$new_json"
 }
 
@@ -192,30 +296,13 @@ state_set_task_phase() {
             return 1
             ;;
     esac
-    local sp now new_json
-    sp="$(state_path)"
-    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    new_json=$(jq \
-        --arg id "$id" \
-        --arg phase "$phase" \
-        --arg now "$now" \
-        '.tasks |= map(if .id == $id then .phase = $phase | .updated_at = $now else . end)' \
-        "$sp") || return 1
-    [[ -n "$new_json" ]] || { echo "state_set_task_phase: empty result" >&2; return 1; }
-    _state_write "$new_json"
+    _with_state_lock _state_set_task_phase_locked "$id" "$phase"
 }
 
-state_set_task_pr() {
+_state_set_task_pr_locked() {
     local id="$1"
     local pr_number="$2"
     local pr_url="$3"
-    # pr_number must be a non-negative integer; reject anything else so jq's
-    # --argjson doesn't blow up on non-numeric input (and so a value like
-    # `null) | .secret = ...` can't sneak through).
-    if ! [[ "$pr_number" =~ ^[0-9]+$ ]]; then
-        echo "state_set_task_pr: pr_number must be a non-negative integer (got '$pr_number')" >&2
-        return 1
-    fi
     local sp now new_json
     sp="$(state_path)"
     now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -230,10 +317,26 @@ state_set_task_pr() {
     _state_write "$new_json"
 }
 
+state_set_task_pr() {
+    local id="$1"
+    local pr_number="$2"
+    local pr_url="$3"
+    # pr_number must be a non-negative integer; reject anything else so jq's
+    # --argjson doesn't blow up on non-numeric input (and so a value like
+    # `null) | .secret = ...` can't sneak through).
+    if ! [[ "$pr_number" =~ ^[0-9]+$ ]]; then
+        echo "state_set_task_pr: pr_number must be a non-negative integer (got '$pr_number')" >&2
+        return 1
+    fi
+    _with_state_lock _state_set_task_pr_locked "$id" "$pr_number" "$pr_url"
+}
+
 # state_acquire_lease <task_id> <session_id> <branch> <head_sha>
-# Atomic-ish: validates that the task is currently pending and there's no
-# competing lease, then writes the lease + flips status.
-state_acquire_lease() {
+# Atomic read-check-write: validates that the task is currently pending and
+# there's no competing lease, then writes the lease + flips status. The whole
+# sequence runs under an exclusive flock on .handoff/state.lock so two
+# concurrent callers cannot race past the precondition checks (B5).
+_state_acquire_lease_locked() {
     local id="$1"
     local session_id="$2"
     local branch="$3"
@@ -292,16 +395,28 @@ state_acquire_lease() {
     _state_write "$new_json"
 }
 
+state_acquire_lease() {
+    local id="$1"
+    local session_id="$2"
+    local branch="$3"
+    local head_sha="$4"
+
+    # Reject malformed inputs before they reach git or state.json (M3).
+    if ! _validate_task_id "$id"; then
+        return 4
+    fi
+    if ! _validate_branch "$branch"; then
+        return 5
+    fi
+    _with_state_lock _state_acquire_lease_locked "$id" "$session_id" "$branch" "$head_sha"
+}
+
 # state_release_lease <task_id> <session_id> <final_status>
 # Verifies the lease belongs to this session before clearing.
-state_release_lease() {
+_state_release_lease_locked() {
     local id="$1"
     local session_id="$2"
     local final_status="$3"
-    case "$final_status" in
-        pending|pr_open|blocked|done) ;;
-        *) echo "state_release_lease: invalid final_status '$final_status'" >&2; return 1 ;;
-    esac
 
     local sp
     sp="$(state_path)"
@@ -332,6 +447,17 @@ state_release_lease() {
         | .current_lease = null
         ' "$sp")
     _state_write "$new_json"
+}
+
+state_release_lease() {
+    local id="$1"
+    local session_id="$2"
+    local final_status="$3"
+    case "$final_status" in
+        pending|pr_open|blocked|done) ;;
+        *) echo "state_release_lease: invalid final_status '$final_status'" >&2; return 1 ;;
+    esac
+    _with_state_lock _state_release_lease_locked "$id" "$session_id" "$final_status"
 }
 
 # Refuse a write if the caller's session is not the lease owner. Used by any

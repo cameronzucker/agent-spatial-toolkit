@@ -220,6 +220,91 @@ JSON
     [[ "$output" == "null" ]]
 }
 
+@test "state_acquire_lease serialized under flock — concurrent acquire produces exactly one winner (B5)" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"pending","branch":"feat/t","attempts":0,"depends_on":[]}
+  ],
+  "current_lease": null
+}
+JSON
+    # Spawn N concurrent attempts; exactly one must win, rest must report
+    # "another lease is active" or "not pending" depending on race ordering.
+    local out_dir="$BATS_TEST_TMPDIR/race"
+    mkdir -p "$out_dir"
+    local i
+    for i in 1 2 3 4 5; do
+        (
+            export AUTO_CLAUDE_REPO_ROOT="$AUTO_CLAUDE_REPO_ROOT"
+            source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+            if state_acquire_lease "TASK-1" "sess-$i" "feat/t" "deadbeef" >/dev/null 2>&1; then
+                echo "won" > "$out_dir/result-$i"
+            else
+                echo "lost" > "$out_dir/result-$i"
+            fi
+        ) &
+    done
+    wait
+    # Exactly one winner.
+    local wins
+    wins=$(grep -l '^won$' "$out_dir"/result-* 2>/dev/null | wc -l)
+    [[ "$wins" -eq 1 ]]
+    # state.json reflects exactly one lease.
+    local lease_count
+    lease_count=$(jq -r 'if .current_lease then 1 else 0 end' "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json")
+    [[ "$lease_count" -eq 1 ]]
+    # Task is leased.
+    local status
+    status=$(jq -r '.tasks[0].status' "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json")
+    [[ "$status" == "leased" ]]
+    # attempts incremented exactly once (winner only).
+    local attempts
+    attempts=$(jq -r '.tasks[0].attempts' "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json")
+    [[ "$attempts" == "1" ]]
+}
+
+@test "state_acquire_lease rejects task_id with leading dash (M3)" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{"schema_version":1,"tasks":[],"current_lease":null}
+JSON
+    run state_acquire_lease "-D" "sess-A" "feat/t" "deadbeef"
+    [[ "$status" -ne 0 ]]
+}
+
+@test "state_acquire_lease rejects branch starting with dash (M3)" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"pending","branch":"--orphan","attempts":0,"depends_on":[]}
+  ],
+  "current_lease": null
+}
+JSON
+    run state_acquire_lease "TASK-1" "sess-A" "--orphan" "deadbeef"
+    [[ "$status" -ne 0 ]]
+}
+
+@test "state_acquire_lease rejects branch with embedded dotdot (M3)" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"pending","branch":"feat/x","attempts":0,"depends_on":[]}
+  ],
+  "current_lease": null
+}
+JSON
+    run state_acquire_lease "TASK-1" "sess-A" "feat/..hack" "deadbeef"
+    [[ "$status" -ne 0 ]]
+}
+
 @test "state_release_lease refuses cross-session" {
     source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
     cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'

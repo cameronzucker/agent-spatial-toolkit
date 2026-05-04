@@ -11,6 +11,9 @@
         h2 { font-size: 1rem; margin: 0 0 0.5rem; }
         main { display: flex; flex-direction: column; gap: 1rem; }
         .phase { padding: 1rem; border: 1px solid #ddd; border-radius: 4px; background: #fafafa; }
+        /* Defensive: mirrors the UA stylesheet's [hidden] rule. Load-bearing
+           against a future `.phase { display: flex }` author rule that would
+           otherwise outrank the UA-level hidden behavior. Don't drop in 1.D.9. */
         .phase[hidden] { display: none; }
         .placeholder { color: #777; font-style: italic; margin: 0; }
     </style>

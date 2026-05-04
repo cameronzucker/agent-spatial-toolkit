@@ -1,8 +1,9 @@
 """Dataclasses mirroring the spec §6 annotations.json schema.
 
 Each class has a to_dict() that emits the canonical JSON shape. Inverse
-parsing (from_dict) is also provided for round-trip testing and for the
-session-resume code path.
+parsing (from_dict) is intentionally not provided in v1; agents and
+the wizard server consume annotations.json by reading JSON directly per
+spec §6.485-491.
 """
 
 from __future__ import annotations
@@ -40,9 +41,9 @@ class FeatureClick:
     reprojection_residual_px: float | None = None
     """None means this click came from a planar_intersection (no residual to report)."""
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, include_residual: bool = True) -> dict[str, Any]:
         d: dict[str, Any] = {"photo": self.photo, "pixel": list(self.pixel)}
-        if self.reprojection_residual_px is not None:
+        if include_residual and self.reprojection_residual_px is not None:
             d["reprojection_residual_px"] = float(self.reprojection_residual_px)
         return d
 
@@ -52,11 +53,8 @@ class FeatureClick:
 # ─────────────────────────────────────────────────────────────────────────
 
 
-# Note: pipeline.intrinsics.CameraDetected is a sibling type with an
-# additional focal_length_35mm_equiv field. This schema-layer version
-# is the spec §6 photos[].camera_detected emit shape. The spec reviewer
-# will validate the field set against the spec; if focal_length_35mm_equiv
-# is required by the spec, this dataclass should grow that field.
+# Schema-layer twin of pipeline.intrinsics.CameraDetected; this version
+# intentionally omits focal_length_35mm_equiv per spec §6 lines 389-393.
 @dataclass
 class CameraDetected:
     make: str | None = None
@@ -122,17 +120,36 @@ class FeatureMeasurement:
     z_assumed_mm: float | None = None
     z_assumed_reason: str | None = None
 
+    def __post_init__(self) -> None:
+        is_triangulation = self.method.startswith("triangulation")
+        for i, click in enumerate(self.per_photo_clicks):
+            if is_triangulation and click.reprojection_residual_px is None:
+                raise ValueError(
+                    f"FeatureMeasurement(method={self.method!r}) requires "
+                    f"reprojection_residual_px on every click; "
+                    f"per_photo_clicks[{i}] is None (spec §6 line 423)"
+                )
+            if not is_triangulation and click.reprojection_residual_px is not None:
+                raise ValueError(
+                    f"FeatureMeasurement(method={self.method!r}) must NOT have "
+                    f"reprojection_residual_px on clicks; "
+                    f"per_photo_clicks[{i}].reprojection_residual_px="
+                    f"{click.reprojection_residual_px} (spec §6 line 435-436)"
+                )
+
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {
-            "method": self.method,
-            "per_photo_clicks": [c.to_dict() for c in self.per_photo_clicks],
-        }
-        if self.method.startswith("triangulation"):
+        is_triangulation = self.method.startswith("triangulation")
+        d: dict[str, Any] = {"method": self.method}
+        # Spec §6 §419-425 / §432-438: summary metadata BEFORE per_photo_clicks.
+        if is_triangulation:
             d["triangulation_rms_px"] = self.triangulation_rms_px
             d["max_residual_px"] = self.max_residual_px
         else:  # planar_intersection
             d["z_assumed_mm"] = self.z_assumed_mm
             d["z_assumed_reason"] = self.z_assumed_reason
+        d["per_photo_clicks"] = [
+            c.to_dict(include_residual=is_triangulation) for c in self.per_photo_clicks
+        ]
         return d
 
 

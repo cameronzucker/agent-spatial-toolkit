@@ -25,6 +25,12 @@ def test_to_normalized_px_at_4k_phone_resolution() -> None:
     assert result == pytest.approx(10.0 * 2000 / 4032)
 
 
+def test_to_absolute_px_at_4k_phone_resolution() -> None:
+    """A 4032×3024 photo (typical 12 MP phone): inverse factor = 4032/2000."""
+    result = to_absolute_px(normalized_px=10.0, image_size=(4032, 3024))
+    assert result == pytest.approx(10.0 * 4032 / 2000)
+
+
 def test_to_normalized_px_at_thumbnail_resolution() -> None:
     """A 1024×768 thumbnail: factor = 2000/1024 ~= 1.9531."""
     result = to_normalized_px(absolute_px=5.0, image_size=(1024, 768))
@@ -53,3 +59,11 @@ def test_zero_image_size_raises() -> None:
         to_normalized_px(5.0, (0, 100))
     with pytest.raises(ValueError, match="image_size must be positive"):
         to_normalized_px(5.0, (100, -1))
+
+
+def test_to_absolute_px_zero_image_size_raises() -> None:
+    """Zero or negative image dimensions are invalid (inverse direction too)."""
+    with pytest.raises(ValueError, match="image_size must be positive"):
+        to_absolute_px(5.0, (0, 100))
+    with pytest.raises(ValueError, match="image_size must be positive"):
+        to_absolute_px(5.0, (100, -1))

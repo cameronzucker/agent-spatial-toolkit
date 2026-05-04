@@ -16,15 +16,8 @@ Where this differs from ``test_cli_integration.py``
 That test exercises the math + emit pipeline by direct ``/api/anchors``,
 ``/api/feature``, and ``/api/finalize`` POSTs. This test exercises the
 *UI surface* served at ``GET /`` via a real headless browser. The CLI
-launch + URL-scrape + finalize-on-cleanup machinery is the same; only
-the assertions differ.
-
-Helper duplication
-------------------
-``_scrape_url_from_capfd`` and ``_best_effort_finalize`` are duplicated
-from ``test_cli_integration.py`` to keep this PR's scope narrow. A
-``conftest.py`` extraction is a clean follow-up once a third caller
-appears (likely Task 1.D.5 — first phase that POSTs to a real backend).
+launch + URL-scrape + finalize-on-cleanup machinery is shared via
+``tests/lifecycle_helpers.py``.
 """
 
 from __future__ import annotations
@@ -42,45 +35,11 @@ import pytest
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page
 
+from tests.lifecycle_helpers import best_effort_finalize, scrape_url_from_capfd
+
 FIXTURES = Path(__file__).parent / "fixtures/synthetic_card"
 
 PHASES = ("2a", "2b", "2c", "2d", "2e", "2f")
-
-
-def _scrape_url_from_capfd(capfd: pytest.CaptureFixture[str], timeout_s: float = 5.0) -> str:
-    """Poll captured stdout for the ``Open <url> ...`` line printed by cli._annotate.
-
-    capfd (file-descriptor capture) is required: the CLI runs in a
-    background thread and writes via flush=True; pytest's default ``capsys``
-    misses cross-thread writes.
-    """
-    deadline = time.monotonic() + timeout_s
-    accumulated = ""
-    while time.monotonic() < deadline:
-        captured = capfd.readouterr()
-        accumulated += captured.out
-        if "http://" in accumulated:
-            for word in accumulated.split():
-                if word.startswith("http://"):
-                    return word.rstrip(".,")
-        time.sleep(0.05)
-    raise AssertionError(f"CLI did not print server URL within {timeout_s}s; got: {accumulated!r}")
-
-
-def _best_effort_finalize(url: str, timeout_s: float = 2.0) -> None:
-    """Trigger /api/finalize, suppressing all errors. Used in test cleanup
-    paths to ensure a mid-test failure doesn't leak the lifecycle server's
-    bound port + daemon thread into downstream tests in the same session.
-    """
-    with contextlib.suppress(Exception):
-        req = urllib.request.Request(
-            f"{url.rstrip('/')}/api/finalize",
-            data=b"{}",
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            resp.read()
 
 
 def _http_post_json(url: str, body: dict[str, Any], timeout_s: float = 5.0) -> dict[str, Any]:
@@ -174,7 +133,7 @@ def test_ui_wizard_shell_renders_all_six_phase_containers(
 
     url: str | None = None
     try:
-        url = _scrape_url_from_capfd(capfd)
+        url = scrape_url_from_capfd(capfd)
 
         _navigate_with_retry(page, url)
 
@@ -227,7 +186,7 @@ def test_ui_wizard_shell_renders_all_six_phase_containers(
         # scraped (e.g., scrape timeout after socket bind succeeded).
         if cli_thread.is_alive():
             if url is not None:
-                _best_effort_finalize(url)
+                best_effort_finalize(url)
             elif server_ref["server"] is not None:
                 with contextlib.suppress(Exception):
                     server_ref["server"].shutdown()

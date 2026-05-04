@@ -653,3 +653,12 @@ def _register_routes(app: Flask) -> None:
     def static_overlay(requested_id: str) -> Any:
         session: Session = app.config["SESSION"]
         return _safe_static_send(session.session_dir / "overlays", requested_id)
+
+    @app.get("/ui/<path:filename>")
+    def ui_asset(filename: str) -> Any:
+        # Serve helpers.js / app.js / style.css from the package's ui/
+        # directory. ``app.root_path`` resolves to the server/ subpackage,
+        # so .parent / "ui" is the sibling UI directory shipped in the
+        # wheel. _safe_static_send guards against ``../`` traversal.
+        ui_dir = Path(app.root_path).parent / "ui"
+        return _safe_static_send(ui_dir, filename)

@@ -41,17 +41,6 @@ class PoseResult:
         }
 
 
-def _camera_matrix(intr: Intrinsics) -> np.ndarray:
-    return np.array(
-        [
-            [intr.fx_px, 0, intr.cx],
-            [0, intr.fy_px, intr.cy],
-            [0, 0, 1],
-        ],
-        dtype=np.float64,
-    )
-
-
 def solve_pnp(
     world_points: np.ndarray,  # (N, 3) part-local mm
     pixel_points: np.ndarray,  # (N, 2) absolute px
@@ -86,7 +75,7 @@ def solve_pnp(
     if not (np.isfinite(world_points).all() and np.isfinite(pixel_points).all()):
         raise PoseSolveError("world_points and pixel_points must be finite (no NaN/Inf)")
 
-    K = _camera_matrix(intrinsics)  # noqa: N806 — canonical CV name for camera matrix
+    K = intrinsics.to_camera_matrix()  # noqa: N806 — canonical CV name for camera matrix
     dist = np.array(intrinsics.distortion, dtype=np.float64)
     obj_pts = world_points.astype(np.float64).reshape(-1, 1, 3)
     img_pts = pixel_points.astype(np.float64).reshape(-1, 1, 2)

@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+import numpy as np
+
 from PIL import ExifTags, Image
 
 # EXIF tag name → tag ID lookup (built once from PIL)
@@ -117,6 +119,17 @@ class Intrinsics:
     distortion: list[float]  # [k1, k2, p1, p2, k3]
     distortion_model: str = "opencv_5param"
     profile_calibration_rms_px: float | None = None
+
+    def to_camera_matrix(self) -> np.ndarray:
+        """Build the 3x3 OpenCV camera (K) matrix from these intrinsics."""
+        return np.array(
+            [
+                [self.fx_px, 0, self.cx],
+                [0, self.fy_px, self.cy],
+                [0, 0, 1],
+            ],
+            dtype=np.float64,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to the spec §6 schema shape."""

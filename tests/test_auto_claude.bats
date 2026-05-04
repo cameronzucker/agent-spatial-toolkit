@@ -695,6 +695,64 @@ JSON
     [[ "$output" == "quiescent" ]]
 }
 
+@test "watchdog refuses to rm a lock whose session_id changed since reconcile (B6)" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"pending","branch":"feat/t","attempts":0,"depends_on":[]}
+  ],
+  "current_lease": null
+}
+JSON
+    # Replace reconcile.sh with a fake that reports lock.state=stale with
+    # session_id "ghost" — but we'll write a real lock with session_id
+    # "alive" so the verify-then-rm pass detects the mismatch and aborts.
+    cat > "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/reconcile.sh" <<'SH'
+#!/usr/bin/env bash
+# Fake reconcile for B6 test. Reports a stale lock with stale session_id
+# even though the actual lock on disk has a different session_id (because
+# a new live session has taken it between snapshot and decision).
+cat <<JSON
+{"lock":{"state":"stale","session_id":"ghost","pid":99999,"heartbeat_at":"2020-01-01T00:00:00Z","age_s":7200,"boot_match":true},"git":{"state":"clean","branch":"main","upstream":"","ahead":0},"gh":{"open_prs":[],"fetched":false},"state_file":{"present":true,"valid":true},"current_lease_task":null,"next_pending_task":{"id":"TASK-1","title":"t","status":"pending","branch":"feat/t","attempts":0,"depends_on":[]}}
+JSON
+SH
+    chmod +x "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/reconcile.sh"
+
+    # Write a real lock with a *different* session_id — represents a live
+    # session that grabbed the slot between reconcile snapshot and rm.
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/.lock" <<'JSON'
+{
+  "session_id":"alive",
+  "pid":1,
+  "ppid":1,
+  "host":"test",
+  "boot_id":"test-boot",
+  "started_at":"2030-01-01T00:00:00Z",
+  "heartbeat_at":"2030-01-01T00:00:00Z",
+  "current_branch":"feat/t",
+  "current_task_id":"TASK-1",
+  "phase":"editing"
+}
+JSON
+
+    AUTO_CLAUDE_DRY_RUN=1 run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/watchdog.sh"
+    [[ "$status" -eq 0 ]]
+
+    # Critical: the live session's lock was NOT deleted.
+    [[ -f "$AUTO_CLAUDE_REPO_ROOT/.handoff/.lock" ]]
+    run jq -r '.session_id' "$AUTO_CLAUDE_REPO_ROOT/.handoff/.lock"
+    [[ "$output" == "alive" ]]
+
+    # And we audited the abort.
+    run grep -c '"type":"alert_lock_changed_during_cleanup"' "$AUTO_CLAUDE_REPO_ROOT/.handoff/events.jsonl"
+    [[ "$output" -ge 1 ]]
+    # And we did NOT spawn (the cleanup aborted, so consider_spawn never set).
+    run grep -c '"type":"spawn_intent"' "$AUTO_CLAUDE_REPO_ROOT/.handoff/events.jsonl"
+    [[ "$output" == "0" ]]
+}
+
 @test "watchdog refuses to spawn when git is mid-merge" {
     source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
     cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'

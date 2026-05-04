@@ -1,7 +1,9 @@
 """Tests for server/events.py — append-only JSONL event stream."""
 
 import json
+import os
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_spatial_toolkit.server.events import EventLog
 
@@ -74,3 +76,45 @@ def test_event_log_multi_instance_appends(tmp_path: Path) -> None:
     log_b.write({"type": "second"})
     events = list(log_b.replay())
     assert [e["type"] for e in events] == ["first", "second"]
+
+
+# ── fsync durability tests ──────────────────────────────────────────
+
+
+def test_event_log_write_default_no_fsync(tmp_path: Path) -> None:
+    """By default, write() does NOT call os.fsync (backward-compat)."""
+    log = EventLog(tmp_path / "events.jsonl")
+    with patch.object(os, "fsync") as mock_fsync:
+        log.write({"type": "test"})
+    mock_fsync.assert_not_called()
+
+
+def test_event_log_write_fsync_true_calls_os_fsync(tmp_path: Path) -> None:
+    """When fsync=True, write() calls os.fsync on the file descriptor."""
+    log = EventLog(tmp_path / "events.jsonl")
+    with patch.object(os, "fsync") as mock_fsync:
+        log.write({"type": "test"}, fsync=True)
+    mock_fsync.assert_called_once()
+    # The argument should be a valid file descriptor (int)
+    fd_arg = mock_fsync.call_args[0][0]
+    assert isinstance(fd_arg, int)
+
+
+def test_event_log_write_fsync_false_explicit(tmp_path: Path) -> None:
+    """Explicit fsync=False behaves same as default — no fsync."""
+    log = EventLog(tmp_path / "events.jsonl")
+    with patch.object(os, "fsync") as mock_fsync:
+        log.write({"type": "test"}, fsync=False)
+    mock_fsync.assert_not_called()
+
+
+def test_event_log_write_fsync_data_still_written(tmp_path: Path) -> None:
+    """fsync=True doesn't break normal write behavior."""
+    log_path = tmp_path / "events.jsonl"
+    log = EventLog(log_path)
+    log.write({"type": "durable_event", "val": 42}, fsync=True)
+    events = list(log.replay())
+    assert len(events) == 1
+    assert events[0]["type"] == "durable_event"
+    assert events[0]["val"] == 42
+    assert "ts" in events[0]

@@ -237,22 +237,102 @@ $EDITOR .handoff/state.json              # add tasks
 scripts/auto_claude/watchdog.sh --dry-run  # confirm it picks up the next task
 ```
 
-### 6.2 Manual loop (until PR C lands)
+Then install the scheduler. Two paths, pick one:
 
-The watchdog is idempotent and concurrency-safe via flock. Run it on
-a 1-minute cron:
+### 6.2 Scheduling — systemd (preferred)
 
-```cron
-* * * * * cd /home/me/Code/myproject && scripts/auto_claude/watchdog.sh >>.handoff/logs/cron.log 2>&1
-```
+Use this on Linux hosts where the user systemd instance is running
+(every modern desktop, the Pi 5 with bookworm, etc.). It integrates with
+journald, survives reboots, and gives clean `--status` / `--uninstall`
+verbs. **No root required** — everything writes under
+`~/.config/systemd/user/`.
 
-Or systemd timer (PR C ships the unit). For ad-hoc runs:
+One-time prerequisite if you want the timer to keep running across
+logouts (recommended for an unattended Pi):
 
 ```bash
-scripts/auto_claude/watchdog.sh
+sudo loginctl enable-linger "$USER"
 ```
 
-### 6.3 Status check
+`install_systemd.sh` will warn if linger is not enabled but won't fail.
+
+Install:
+
+```bash
+./scripts/auto_claude/install_systemd.sh           # idempotent
+./scripts/auto_claude/install_systemd.sh --dry-run # inspect first
+```
+
+What the installer does:
+
+1. Verifies `systemctl --user` is available; bails to the cron path otherwise.
+2. Substitutes `@PROJECT_ROOT@` and `@USER@` in the templates under
+   `systemd/` and writes the unit + timer to
+   `~/.config/systemd/user/claude-watchdog.{service,timer}`.
+3. Runs `systemctl --user daemon-reload`.
+4. Enables + starts the timer.
+5. Prints the next firing time and the tail command.
+
+Cadence is `OnUnitActiveSec=20min`, with `Persistent=true` so missed
+runs after a reboot or sleep fire a catch-up tick.
+
+Monitor:
+
+```bash
+journalctl --user -u claude-watchdog -f      # tail live
+journalctl --user -u claude-watchdog --since='1 hour ago'
+./scripts/auto_claude/install_systemd.sh --status
+```
+
+Pause / resume:
+
+```bash
+systemctl --user stop  claude-watchdog.timer    # pause (timer stays installed)
+systemctl --user start claude-watchdog.timer    # resume
+```
+
+If the watchdog is in `backoff_until`, clear it manually by editing
+`.handoff/state.json` (or `.handoff/.backoff.json`) under a quiet moment.
+
+Uninstall:
+
+```bash
+./scripts/auto_claude/install_systemd.sh --uninstall
+```
+
+This stops + disables the timer, removes the two unit files, and
+daemon-reloads. Safe to re-run.
+
+### 6.3 Scheduling — cron (fallback)
+
+Use this if user systemd isn't available, or you just prefer cron:
+
+```bash
+./scripts/auto_claude/install_cron.sh              # idempotent
+./scripts/auto_claude/install_cron.sh --dry-run    # inspect first
+./scripts/auto_claude/install_cron.sh --force      # replace existing entry
+./scripts/auto_claude/install_cron.sh --uninstall
+./scripts/auto_claude/install_cron.sh --status
+```
+
+The installer reads your current crontab, refuses to add a duplicate
+(without `--force`), and surrounds its block with
+`# >>> auto-claude watchdog (managed) >>>` /
+`# <<< auto-claude watchdog (managed) <<<` marker comments so uninstall
+is a clean delete-between-fences. The substituted block is in
+`systemd/cron-template.txt`.
+
+Default cadence: `*/20 * * * *`. Output goes to
+`.handoff/logs/cron.log`, not mail.
+
+Monitor:
+
+```bash
+tail -f .handoff/logs/cron.log
+./scripts/auto_claude/install_cron.sh --status
+```
+
+### 6.4 Status check
 
 `STATUS.md` is regenerated every watchdog tick:
 
@@ -269,6 +349,25 @@ tail -20 .handoff/events.jsonl | jq -c '{ts,type,task_id,decision,reason}'
 The SessionStart hook also injects a status brief into every Claude
 session that opens in this repo, so just running `claude` will show you
 where things are.
+
+### 6.5 Worked example (this Pi)
+
+Bring it up on `agent-spatial-toolkit`, on a Raspberry Pi 5 running
+bookworm with user `administrator`:
+
+```bash
+cd /home/administrator/Code/agent-spatial-toolkit
+sudo loginctl enable-linger administrator             # one-time, optional but recommended
+./scripts/auto_claude/install.sh                      # bootstrap .handoff/
+$EDITOR .handoff/state.json                           # add at least one task
+./scripts/auto_claude/watchdog.sh --dry-run           # sanity-check decision
+./scripts/auto_claude/install_systemd.sh --dry-run    # see what we'd write
+./scripts/auto_claude/install_systemd.sh              # actually install
+systemctl --user start claude-watchdog.service        # force one tick now
+journalctl --user -u claude-watchdog --since='2 min ago'
+./scripts/auto_claude/install_systemd.sh --status     # combined health check
+./scripts/auto_claude/install_systemd.sh --uninstall  # remove when done
+```
 
 ## 7. Failure modes and recovery
 

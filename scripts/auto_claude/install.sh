@@ -89,8 +89,12 @@ auto-claude installed. Next steps:
   1. Edit $(state_path) to add tasks (see state.example.json for the shape).
   2. Try a dry run:
          scripts/auto_claude/watchdog.sh --dry-run
-  3. PR C will add the cron / systemd unit. For now you can drive it manually:
-         scripts/auto_claude/watchdog.sh
+  3. Install the scheduler:
+         systemd (preferred):  ./scripts/auto_claude/install_systemd.sh
+         cron (fallback):      ./scripts/auto_claude/install_cron.sh
+     See docs/auto-claude-design.md §6 for details, including how to
+     monitor, pause, and uninstall. Both installers support --dry-run.
 
-For status, look at .handoff/STATUS.md after each watchdog run.
+For status, look at .handoff/STATUS.md after each watchdog run, or run
+  scripts/auto_claude/install_systemd.sh --status   (or install_cron.sh --status)
 EOF

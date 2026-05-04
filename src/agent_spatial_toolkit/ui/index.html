@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>agent-spatial-toolkit — Wizard</title>
+    <style>
+        /* Skeleton layout for Task 1.D.1. The 1.D.9 styling pass replaces this. */
+        body { font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 1.5rem; max-width: 960px; color: #222; }
+        h1 { font-size: 1.25rem; margin: 0 0 1rem; }
+        h2 { font-size: 1rem; margin: 0 0 0.5rem; }
+        main { display: flex; flex-direction: column; gap: 1rem; }
+        .phase { padding: 1rem; border: 1px solid #ddd; border-radius: 4px; background: #fafafa; }
+        .phase[hidden] { display: none; }
+        .placeholder { color: #777; font-style: italic; margin: 0; }
+    </style>
+</head>
+<body>
+    <h1>agent-spatial-toolkit — Wizard</h1>
+    <main id="wizard">
+        <!-- Spec §3 Phase 2a — upload + EXIF + view labels (wired in 1.D.3). -->
+        <section id="phase-2a" class="phase">
+            <h2>Phase 2a — Upload and validate</h2>
+            <p class="placeholder">Photo upload, EXIF parsing, and lens/view selection wire up in Task 1.D.3.</p>
+        </section>
+
+        <!-- Spec §3 Phase 2b — reference frame declaration (wired in 1.D.4). -->
+        <section id="phase-2b" class="phase" hidden>
+            <h2>Phase 2b — Reference frame declaration</h2>
+            <p class="placeholder">Frame preset + known dimensions form wires up in Task 1.D.4.</p>
+        </section>
+
+        <!-- Spec §3 Phase 2c — per-photo anchors (wired in 1.D.5). -->
+        <section id="phase-2c" class="phase" hidden>
+            <h2>Phase 2c — Per-photo anchors</h2>
+            <p class="placeholder">Anchor click capture + /api/anchors POST wires up in Task 1.D.5.</p>
+        </section>
+
+        <!-- Spec §3 Phase 2d — feature labeling (wired in 1.D.6). -->
+        <section id="phase-2d" class="phase" hidden>
+            <h2>Phase 2d — Feature labeling</h2>
+            <p class="placeholder">Feature click + label + /api/feature POST wires up in Task 1.D.6.</p>
+        </section>
+
+        <!-- Spec §3 Phase 2e — validation overlay (wired in 1.D.7). -->
+        <section id="phase-2e" class="phase" hidden>
+            <h2>Phase 2e — Validation overlay</h2>
+            <p class="placeholder">Overlay PNG display + confirm/re-click wires up in Task 1.D.7.</p>
+        </section>
+
+        <!-- Spec §3 Phase 2f — emit (wired in 1.D.8). -->
+        <section id="phase-2f" class="phase" hidden>
+            <h2>Phase 2f — Emit</h2>
+            <p class="placeholder">/api/finalize + download link wires up in Task 1.D.8.</p>
+        </section>
+    </main>
+</body>
+</html>

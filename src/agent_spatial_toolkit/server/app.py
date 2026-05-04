@@ -300,11 +300,13 @@ def _register_routes(app: Flask) -> None:
     def index() -> Any:
         """Serve ``ui/index.html`` if present, else a placeholder.
 
-        Stream D (UI build) ships index.html. For this PR the UI does not
-        exist yet — return 200 with a placeholder so the URL works and
-        clients can still poll the API alongside.
+        ``app.root_path`` resolves to the directory of the module that
+        constructed the Flask instance — here ``…/agent_spatial_toolkit/server/``
+        — so the UI lives in the sibling ``ui/`` directory inside the package
+        (``…/agent_spatial_toolkit/ui/index.html``). Keeping UI inside the
+        installable package is the only layout that survives a wheel build.
         """
-        ui_index = Path(app.root_path).parent.parent.parent / "ui" / "index.html"
+        ui_index = Path(app.root_path).parent / "ui" / "index.html"
         if ui_index.is_file():
             return ui_index.read_text(encoding="utf-8"), 200, {"Content-Type": "text/html"}
         return (

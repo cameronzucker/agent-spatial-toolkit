@@ -17,6 +17,12 @@ from agent_spatial_toolkit.schema.models import (
     ReferenceFrame,
     SessionArtifacts,
 )
+from agent_spatial_toolkit.schema.validators import (
+    QUALITY_FLAGS,
+    ValidationError,
+    validate_annotations,
+    validate_quality_flag,
+)
 
 
 def test_minimal_annotations_serializes() -> None:
@@ -287,3 +293,78 @@ def test_annotations_with_photos_and_features_round_trips() -> None:
     measurement_keys = list(parsed["features"][0]["measurements"].keys())
     assert measurement_keys.index("z_assumed_mm") < measurement_keys.index("per_photo_clicks")
     assert measurement_keys.index("z_assumed_reason") < measurement_keys.index("per_photo_clicks")
+
+
+def test_validate_quality_flag_accepts_known() -> None:
+    """Known flags pass."""
+    validate_quality_flag("intrinsics_suspect_high_anchor_rms")
+    validate_quality_flag("feature_clicked_only_once:gpio_socket_center")
+    validate_quality_flag("photo_excluded_due_to_pose_failure:long_edge_a")
+
+
+def test_validate_quality_flag_rejects_unknown() -> None:
+    with pytest.raises(ValidationError, match="not a recognized flag"):
+        validate_quality_flag("totally_made_up_flag")
+
+
+def test_validate_quality_flag_parameterized_must_have_id() -> None:
+    """Flags marked parameterized require ':<id>' suffix."""
+    with pytest.raises(ValidationError, match="requires ':<id>'"):
+        validate_quality_flag("feature_clicked_only_once")  # missing :<id>
+
+
+def test_quality_flags_constant_is_complete() -> None:
+    """The closed enum contains all six flags from spec §6."""
+    expected = {
+        "intrinsics_suspect_high_anchor_rms",
+        "intrinsics_session_recommend_chessboard",
+        "photo_excluded_due_to_pose_failure",
+        "feature_clicked_only_once",
+        "feature_high_triangulation_rms",
+        "ultrawide_lens_rejected",
+    }
+    assert set(QUALITY_FLAGS.keys()) == expected
+
+
+def test_validate_quality_flag_rejects_parameterless_with_id() -> None:
+    """A parameterless flag with a stray :<id> must raise."""
+    with pytest.raises(ValidationError, match="does not take an :<id>"):
+        validate_quality_flag("intrinsics_suspect_high_anchor_rms:something")
+
+
+def test_validate_quality_flag_rejects_empty_suffix() -> None:
+    """A parameterized flag with empty :<id> must raise."""
+    with pytest.raises(ValidationError, match="empty :<id>"):
+        validate_quality_flag("feature_clicked_only_once:")
+
+
+def test_validate_quality_flag_rejects_multi_colon_suffix() -> None:
+    """A parameterized flag with multiple colons must raise (spec §6 single-token id)."""
+    with pytest.raises(ValidationError, match="multi-colon"):
+        validate_quality_flag("feature_clicked_only_once:foo:bar")
+
+
+def test_validate_annotations_happy_path() -> None:
+    """A document with valid flags passes validation."""
+    data = {
+        "quality_summary": {
+            "flags": [
+                "intrinsics_suspect_high_anchor_rms",
+                "feature_clicked_only_once:gpio_socket_center",
+            ],
+        },
+    }
+    validate_annotations(data)  # no exception
+
+
+def test_validate_annotations_missing_quality_summary_raises() -> None:
+    """A document missing quality_summary raises."""
+    with pytest.raises(ValidationError, match="missing required 'quality_summary'"):
+        validate_annotations({})
+
+
+def test_validate_annotations_invalid_flag_raises() -> None:
+    """A document with an invalid flag raises (delegates to validate_quality_flag)."""
+    data = {"quality_summary": {"flags": ["totally_made_up_flag"]}}
+    with pytest.raises(ValidationError, match="not a recognized flag"):
+        validate_annotations(data)

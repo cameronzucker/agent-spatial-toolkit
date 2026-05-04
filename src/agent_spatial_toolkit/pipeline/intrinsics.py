@@ -93,7 +93,9 @@ FOV_CLASS_TELEPHOTO = "telephoto"
 # Numbers derived empirically from chessboard calibrations of common phone
 # cameras; a derivation document is added in v0.1.0 once chessboard
 # calibration is functional and we can compute residuals against truth.
-# XXX SIGN-VALIDATE: see follow-up issue (TBD by orchestrator)
+# XXX SIGN-VALIDATE: positive k1 here models pincushion in OpenCV's
+# convention; phone wide/normal lenses typically need negative k1
+# (barrel). Validate against chessboard ground truth in Tier A — see #9.
 _FOV_CLASS_DISTORTION = {
     FOV_CLASS_WIDE: [0.025, 0.000, 0.0, 0.0, 0.0],  # k1, k2, p1, p2, k3
     FOV_CLASS_NORMAL: [0.010, 0.005, 0.0, 0.0, 0.0],

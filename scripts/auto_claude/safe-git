@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+# safe-git — guarded wrapper around git.
+#
+# Subagents and session scripts MUST use this wrapper instead of `git`.
+# It refuses destructive operations and verifies cwd + branch match the
+# current lease before allowing mutating operations.
+#
+# Exit codes:
+#   0    — success (forwarded from git)
+#   2    — cwd mismatch with current_lease.cwd_root
+#   3    — branch mismatch with current_lease.branch on a mutating op
+#   4    — refused: blacklisted operation regardless of caller
+#   5    — refused: no current lease + mutating op attempted
+#   N    — passthrough git exit code on transparent ops
+#
+# Reads .handoff/state.json for the current lease. Logs every invocation.
+
+set -euo pipefail
+
+_self="${BASH_SOURCE[0]}"
+SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
+AUTO_CLAUDE_REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+export AUTO_CLAUDE_REPO_ROOT
+
+# shellcheck source=audit.sh
+source "$SCRIPT_DIR/audit.sh"
+# shellcheck source=state_helpers.sh
+source "$SCRIPT_DIR/state_helpers.sh"
+
+# Find the real git on PATH, ignoring this wrapper if PATH puts us first.
+real_git() {
+    local g
+    for g in /usr/bin/git /usr/local/bin/git /opt/homebrew/bin/git; do
+        if [[ -x "$g" ]]; then
+            "$g" "$@"
+            return $?
+        fi
+    done
+    # Fall back to PATH search but skip our own dir
+    local p oldifs="$IFS"
+    IFS=:
+    for p in $PATH; do
+        IFS="$oldifs"
+        if [[ "$p" != "$SCRIPT_DIR" && -x "$p/git" ]]; then
+            "$p/git" "$@"
+            return $?
+        fi
+        IFS=:
+    done
+    IFS="$oldifs"
+    echo "safe-git: real git binary not found on PATH" >&2
+    return 127
+}
+
+usage() {
+    cat <<'EOF'
+safe-git — guarded git wrapper
+
+Usage:
+    safe-git <git-subcommand> [args...]
+
+Behavior:
+    * Verifies pwd matches current_lease.cwd_root (exit 2 on mismatch).
+    * Verifies current branch matches current_lease.branch on mutating ops
+      (exit 3 on mismatch).
+    * Refuses destructive ops regardless of caller (exit 4).
+    * Logs every invocation to .handoff/events.jsonl.
+    * Otherwise transparent: forwards args to git.
+EOF
+}
+
+if [[ $# -eq 0 || "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    usage
+    exit 0
+fi
+
+# Categorize the subcommand. The first non-flag arg is the subcommand.
+# (We don't support pre-subcommand options like `git -c foo=bar` here; if a
+# caller needs that, they should set them via env or use real git directly.)
+subcmd="$1"
+shift || true
+# Use a sentinel to allow safe iteration when no remaining args. With set -u
+# `${args[@]:-}` expands to a literal empty string, which we never want to
+# forward to git.
+if (( $# > 0 )); then
+    args=("$@")
+else
+    args=()
+fi
+
+# Read-only set: always allowed even without a lease.
+read_only_subcmds=(status log diff show branch rev-parse reflog ls-files \
+    config remote describe blame fetch ls-remote symbolic-ref shortlog \
+    rev-list cat-file for-each-ref name-rev tag stash help version)
+
+is_read_only=0
+for ro in "${read_only_subcmds[@]}"; do
+    if [[ "$subcmd" == "$ro" ]]; then
+        is_read_only=1
+        break
+    fi
+done
+# `branch` is only read-only when used without -d/-D/-m/-M flags
+if [[ "$subcmd" == "branch" ]]; then
+    for a in "${args[@]+"${args[@]}"}"; do
+        case "$a" in
+            -d|-D|-m|-M|--delete|--move|--force) is_read_only=0 ;;
+        esac
+    done
+fi
+# `tag` is only read-only without -d
+if [[ "$subcmd" == "tag" ]]; then
+    for a in "${args[@]+"${args[@]}"}"; do
+        case "$a" in
+            -d|--delete|-f|--force) is_read_only=0 ;;
+        esac
+    done
+fi
+# `stash` push/pop/drop/clear all mutate
+if [[ "$subcmd" == "stash" ]]; then
+    case "${args[0]:-list}" in
+        list|show) ;;
+        *) is_read_only=0 ;;
+    esac
+fi
+# fetch is read-only relative to working tree, but document we allow it.
+
+# ---- Hard refusals: blacklisted no matter what. -----------------------
+refuse() {
+    local reason="$1"
+    echo "safe-git: REFUSED — $reason" >&2
+    local args_json
+    if (( ${#args[@]} > 0 )); then
+        args_json=$(printf '%s\n' "${args[@]}" | jq -R . | jq -s .)
+    else
+        args_json='[]'
+    fi
+    audit_event "git_refused" "$(jq -cn \
+        --arg subcmd "$subcmd" \
+        --arg reason "$reason" \
+        --argjson args "$args_json" \
+        '{subcmd:$subcmd, reason:$reason, args:$args}')"
+    exit 4
+}
+
+case "$subcmd" in
+    worktree)
+        # `worktree list` is read-only and useful, but `add`/`remove`/`prune`
+        # all touch state we don't want.
+        case "${args[0]:-}" in
+            list) ;;
+            add|remove|move|prune|repair|lock|unlock)
+                refuse "git worktree $subcmd subcommand banned (use branch-per-task instead)"
+                ;;
+            *)
+                refuse "git worktree subcommands banned"
+                ;;
+        esac
+        ;;
+    reset)
+        for a in "${args[@]+"${args[@]}"}"; do
+            if [[ "$a" == "--hard" ]]; then
+                refuse "git reset --hard banned"
+            fi
+        done
+        ;;
+    clean)
+        for a in "${args[@]+"${args[@]}"}"; do
+            case "$a" in
+                -fd|-fdx|-ffd|-ffdx|-f|--force) refuse "git clean -f banned" ;;
+            esac
+        done
+        ;;
+    branch)
+        for a in "${args[@]+"${args[@]}"}"; do
+            case "$a" in
+                -D|--delete=*) refuse "git branch -D banned" ;;
+                -d|--delete) refuse "git branch -d banned" ;;
+            esac
+        done
+        ;;
+    push)
+        for a in "${args[@]+"${args[@]}"}"; do
+            case "$a" in
+                -f|--force|--force-with-lease=*|--force-with-lease) refuse "git push --force banned" ;;
+            esac
+        done
+        ;;
+esac
+
+# ---- Cwd check (always, mutating or not, when a lease exists) --------
+sp="$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json"
+current_lease="null"
+lease_branch=""
+lease_cwd=""
+lease_task=""
+if [[ -f "$sp" ]]; then
+    current_lease=$(jq -c '.current_lease // null' "$sp" 2>/dev/null || echo "null")
+fi
+
+if [[ "$current_lease" != "null" ]]; then
+    lease_branch=$(jq -r '.branch // empty' <<<"$current_lease")
+    lease_cwd=$(jq -r '.cwd_root // empty' <<<"$current_lease")
+    lease_task=$(jq -r '.task_id // empty' <<<"$current_lease")
+
+    # cwd check — pwd MUST match recorded cwd_root.
+    pwd_real="$(pwd -P)"
+    lease_cwd_real="$lease_cwd"
+    if [[ -n "$lease_cwd_real" && -d "$lease_cwd_real" ]]; then
+        lease_cwd_real="$(cd "$lease_cwd_real" && pwd -P)"
+    fi
+    if [[ -n "$lease_cwd_real" && "$pwd_real" != "$lease_cwd_real" ]]; then
+        echo "safe-git: cwd mismatch — pwd='$pwd_real' but lease.cwd_root='$lease_cwd_real'" >&2
+        audit_event "git_refused" "$(jq -cn \
+            --arg subcmd "$subcmd" \
+            --arg pwd "$pwd_real" \
+            --arg expected "$lease_cwd_real" \
+            '{subcmd:$subcmd, reason:"cwd_mismatch", pwd:$pwd, expected:$expected}')"
+        exit 2
+    fi
+fi
+
+# ---- No-lease + mutating op = refuse. --------------------------------
+if [[ "$current_lease" == "null" && "$is_read_only" -ne 1 ]]; then
+    echo "safe-git: no current lease — refusing mutating op '$subcmd'" >&2
+    audit_event "git_refused" "$(jq -cn --arg subcmd "$subcmd" '{subcmd:$subcmd, reason:"no_lease_mutating"}')"
+    exit 5
+fi
+
+# ---- Branch check on commit/push/checkout/branch/merge/rebase. -------
+needs_branch_check=0
+case "$subcmd" in
+    commit|push|merge|rebase|cherry-pick|am|revert)
+        needs_branch_check=1 ;;
+    checkout|switch)
+        # Allowed: switching to the lease branch or creating a new branch
+        # whose name we can verify (we err on the side of refusing anything
+        # that would leave the lease branch).
+        # Identify a "target branch" arg (last positional) and refuse if it
+        # isn't the lease branch unless -b/--create flag (creating new branch
+        # is fine, it'll be checked out fresh and tested by pre-commit hook).
+        creates_new=0
+        target=""
+        for a in "${args[@]+"${args[@]}"}"; do
+            case "$a" in
+                -b|-B|--create|--orphan) creates_new=1 ;;
+                -*) ;;
+                *) target="$a" ;;
+            esac
+        done
+        if [[ "$creates_new" -eq 0 && -n "$target" && "$target" != "$lease_branch" ]]; then
+            echo "safe-git: refusing to checkout '$target' — current lease is on '$lease_branch'" >&2
+            audit_event "git_refused" "$(jq -cn \
+                --arg subcmd "$subcmd" \
+                --arg target "$target" \
+                --arg lease_branch "$lease_branch" \
+                '{subcmd:$subcmd, reason:"checkout_off_lease", target:$target, lease_branch:$lease_branch}')"
+            exit 4
+        fi
+        ;;
+esac
+
+if [[ "$needs_branch_check" -eq 1 && -n "$lease_branch" ]]; then
+    current_branch=$(real_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "DETACHED")
+    if [[ "$current_branch" != "$lease_branch" ]]; then
+        echo "safe-git: branch mismatch — HEAD='$current_branch' but lease.branch='$lease_branch'" >&2
+        audit_event "git_refused" "$(jq -cn \
+            --arg subcmd "$subcmd" \
+            --arg current "$current_branch" \
+            --arg expected "$lease_branch" \
+            '{subcmd:$subcmd, reason:"branch_mismatch", current:$current, expected:$expected}')"
+        exit 3
+    fi
+fi
+
+# ---- Allowed; record an event and forward. ----------------------------
+sha_before=$(real_git rev-parse HEAD 2>/dev/null || echo "unknown")
+current_branch=$(real_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+if (( ${#args[@]} > 0 )); then
+    args_json=$(printf '%s\n' "$subcmd" "${args[@]}" | jq -R . | jq -s .)
+else
+    args_json=$(printf '%s\n' "$subcmd" | jq -R . | jq -s .)
+fi
+audit_event "git_op" "$(jq -cn \
+    --arg task_id "$lease_task" \
+    --arg cwd "$(pwd -P)" \
+    --arg branch "$current_branch" \
+    --arg sha_before "$sha_before" \
+    --argjson args "$args_json" \
+    '{task_id:$task_id, cwd:$cwd, branch:$branch, sha_before:$sha_before, args:$args}')"
+
+set +e
+if (( ${#args[@]} > 0 )); then
+    real_git "$subcmd" "${args[@]}"
+else
+    real_git "$subcmd"
+fi
+rc=$?
+set -e
+exit $rc

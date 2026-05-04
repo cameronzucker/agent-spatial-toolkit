@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# auto-claude pre-commit hook.
+#
+# Installed by session_boot.sh into .git/hooks/pre-commit. Refuses commits
+# whose cwd or current branch don't match the active lease in
+# .handoff/state.json. If no lease is active, allows the commit (so a human
+# operator can commit normally outside auto-claude context).
+#
+# Exits 0 to allow the commit, 1 to block.
+
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+state_file="$repo_root/.handoff/state.json"
+
+# No state file -> not under auto-claude management; allow.
+if [[ ! -f "$state_file" ]]; then
+    exit 0
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "auto-claude pre-commit: jq not found; allowing commit (cannot verify lease)" >&2
+    exit 0
+fi
+
+current_lease=$(jq -c '.current_lease // null' "$state_file" 2>/dev/null || echo "null")
+
+# No active lease -> allow (human is committing outside the framework).
+if [[ "$current_lease" == "null" ]]; then
+    exit 0
+fi
+
+lease_branch=$(jq -r '.branch // empty' <<<"$current_lease")
+lease_cwd=$(jq -r '.cwd_root // empty' <<<"$current_lease")
+lease_task=$(jq -r '.task_id // empty' <<<"$current_lease")
+
+current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "DETACHED")
+current_cwd="$(pwd -P)"
+
+# Resolve symlinks on lease_cwd if possible so comparison is robust.
+if [[ -n "$lease_cwd" && -d "$lease_cwd" ]]; then
+    lease_cwd="$(cd "$lease_cwd" && pwd -P)"
+fi
+
+errors=()
+
+if [[ -n "$lease_branch" && "$current_branch" != "$lease_branch" ]]; then
+    errors+=("branch mismatch:")
+    errors+=("    expected:  $lease_branch")
+    errors+=("    actual:    $current_branch")
+fi
+
+if [[ -n "$lease_cwd" && "$current_cwd" != "$lease_cwd" ]]; then
+    errors+=("cwd mismatch:")
+    errors+=("    expected:  $lease_cwd")
+    errors+=("    actual:    $current_cwd")
+fi
+
+if (( ${#errors[@]} > 0 )); then
+    {
+        echo "auto-claude pre-commit: REFUSING commit on lease '$lease_task'"
+        for line in "${errors[@]}"; do
+            echo "  $line"
+        done
+        echo
+        echo "If you really need to bypass, the user can clear .handoff/state.json's"
+        echo "current_lease field — but the watchdog will notice the inconsistency."
+    } >&2
+    exit 1
+fi
+
+exit 0

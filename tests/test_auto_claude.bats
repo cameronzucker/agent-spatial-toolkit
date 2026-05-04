@@ -32,6 +32,12 @@ setup() {
     mkdir -p "$TEST_REPO/.handoff"
     cp "$REAL_REPO_ROOT/.handoff/state.example.json" "$TEST_REPO/.handoff/state.example.json"
 
+    # Mirror the systemd/ templates so the deployment installers find them
+    # under $AUTO_CLAUDE_REPO_ROOT/systemd.
+    mkdir -p "$TEST_REPO/systemd"
+    cp "$REAL_REPO_ROOT/systemd"/*.template "$TEST_REPO/systemd/" 2>/dev/null || true
+    cp "$REAL_REPO_ROOT/systemd"/*.txt "$TEST_REPO/systemd/" 2>/dev/null || true
+
     export AUTO_CLAUDE_REPO_ROOT="$TEST_REPO"
     export AUTO_CLAUDE_SESSION_ID="test-session-$$"
 
@@ -1729,4 +1735,242 @@ JSON
     run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/status_render.sh" --stdout
     [[ "$status" -eq 0 ]]
     [[ "$output" == *"session_active"* ]]
+}
+
+# ---- deployment templates + installers (PR C) -------------------------
+#
+# Template substitution is what install_systemd.sh / install_cron.sh do
+# in production. Verify @PROJECT_ROOT@ and @USER@ get replaced cleanly
+# and no @...@ markers survive.
+
+@test "claude-watchdog.service.template has no leftover @...@ markers after substitution" {
+    src="$AUTO_CLAUDE_REPO_ROOT/systemd/claude-watchdog.service.template"
+    [[ -f "$src" ]]
+    out=$(sed -e 's|@PROJECT_ROOT@|/tmp/proj|g' -e 's|@USER@|alice|g' "$src")
+    # Should contain the substituted values
+    [[ "$out" == *"/tmp/proj"* ]]
+    [[ "$out" == *"alice"* ]]
+    # And no surviving placeholders.
+    if echo "$out" | grep -E '@[A-Z_]+@' >/dev/null; then
+        echo "leftover markers in service template:" >&2
+        echo "$out" | grep -E '@[A-Z_]+@' >&2
+        return 1
+    fi
+}
+
+@test "claude-watchdog.timer.template has no leftover @...@ markers after substitution" {
+    src="$AUTO_CLAUDE_REPO_ROOT/systemd/claude-watchdog.timer.template"
+    [[ -f "$src" ]]
+    out=$(sed -e 's|@PROJECT_ROOT@|/tmp/proj|g' -e 's|@USER@|alice|g' "$src")
+    if echo "$out" | grep -E '@[A-Z_]+@' >/dev/null; then
+        echo "leftover markers in timer template:" >&2
+        echo "$out" | grep -E '@[A-Z_]+@' >&2
+        return 1
+    fi
+}
+
+@test "cron-template.txt has no leftover @...@ markers after substitution" {
+    src="$AUTO_CLAUDE_REPO_ROOT/systemd/cron-template.txt"
+    [[ -f "$src" ]]
+    out=$(sed -e 's|@PROJECT_ROOT@|/tmp/proj|g' -e 's|@USER@|alice|g' "$src")
+    [[ "$out" == *"/tmp/proj"* ]]
+    [[ "$out" == *"alice"* ]]
+    if echo "$out" | grep -E '@[A-Z_]+@' >/dev/null; then
+        echo "leftover markers in cron template:" >&2
+        echo "$out" | grep -E '@[A-Z_]+@' >&2
+        return 1
+    fi
+}
+
+@test "install_systemd.sh --status returns nonzero with clear message when not installed" {
+    UNIT_DIR="$TEST_REPO/fake-systemd-user"
+    mkdir -p "$UNIT_DIR"
+    SYSTEMD_USER_UNIT_DIR="$UNIT_DIR" \
+    SYSTEMCTL=true LOGINCTL=true \
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/install_systemd.sh" \
+        --project-root "$AUTO_CLAUDE_REPO_ROOT" --status
+    [[ "$status" -ne 0 ]]
+    [[ "$output" == *"not installed"* ]]
+}
+
+@test "install_systemd.sh is idempotent: run twice, no error, content unchanged" {
+    UNIT_DIR="$TEST_REPO/fake-systemd-user"
+    SYSTEMD_USER_UNIT_DIR="$UNIT_DIR" \
+    SYSTEMCTL=true LOGINCTL=true \
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/install_systemd.sh" \
+        --project-root "$AUTO_CLAUDE_REPO_ROOT"
+    [[ "$status" -eq 0 ]]
+    [[ -f "$UNIT_DIR/claude-watchdog.service" ]]
+    [[ -f "$UNIT_DIR/claude-watchdog.timer" ]]
+    sha_svc_1=$(sha256sum "$UNIT_DIR/claude-watchdog.service" | awk '{print $1}')
+    sha_tim_1=$(sha256sum "$UNIT_DIR/claude-watchdog.timer" | awk '{print $1}')
+
+    SYSTEMD_USER_UNIT_DIR="$UNIT_DIR" \
+    SYSTEMCTL=true LOGINCTL=true \
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/install_systemd.sh" \
+        --project-root "$AUTO_CLAUDE_REPO_ROOT"
+    [[ "$status" -eq 0 ]]
+    sha_svc_2=$(sha256sum "$UNIT_DIR/claude-watchdog.service" | awk '{print $1}')
+    sha_tim_2=$(sha256sum "$UNIT_DIR/claude-watchdog.timer" | awk '{print $1}')
+    [[ "$sha_svc_1" == "$sha_svc_2" ]]
+    [[ "$sha_tim_1" == "$sha_tim_2" ]]
+}
+
+@test "install_systemd.sh --uninstall is safe no-op when nothing is installed" {
+    UNIT_DIR="$TEST_REPO/fake-systemd-user"
+    mkdir -p "$UNIT_DIR"
+    SYSTEMD_USER_UNIT_DIR="$UNIT_DIR" \
+    SYSTEMCTL=true LOGINCTL=true \
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/install_systemd.sh" --uninstall
+    [[ "$status" -eq 0 ]]
+}
+
+@test "install_systemd.sh --dry-run does not write unit files" {
+    UNIT_DIR="$TEST_REPO/fake-systemd-user-dry"
+    SYSTEMD_USER_UNIT_DIR="$UNIT_DIR" \
+    SYSTEMCTL=true LOGINCTL=true \
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/install_systemd.sh" \
+        --project-root "$AUTO_CLAUDE_REPO_ROOT" --dry-run
+    [[ "$status" -eq 0 ]]
+    [[ "$output" == *"[dry-run]"* ]]
+    [[ ! -f "$UNIT_DIR/claude-watchdog.service" ]]
+    [[ ! -f "$UNIT_DIR/claude-watchdog.timer" ]]
+}
+
+# install_cron.sh tests use a stub crontab on PATH so we don't touch the
+# real user crontab. The stub stores its state in $TEST_REPO/fake-cron-state.
+
+_install_cron_stub() {
+    # Create a fake crontab binary and a state file. Returns its dir.
+    local dir="$1"
+    mkdir -p "$dir"
+    : > "$dir/state"
+    cat > "$dir/crontab" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+state_file="${FAKE_CRON_STATE:?FAKE_CRON_STATE required}"
+case "${1:-}" in
+    -l)
+        if [[ -s "$state_file" ]]; then
+            cat "$state_file"
+        else
+            exit 1
+        fi
+        ;;
+    "")
+        echo "stub crontab: bare invocation not supported" >&2
+        exit 2
+        ;;
+    -r)
+        : > "$state_file"
+        ;;
+    *)
+        # crontab <file>
+        cp "$1" "$state_file"
+        ;;
+esac
+STUB
+    chmod +x "$dir/crontab"
+}
+
+@test "install_cron.sh refuses to add a duplicate watchdog entry without --force" {
+    stub_dir="$TEST_REPO/fake-cron"
+    _install_cron_stub "$stub_dir"
+    export FAKE_CRON_STATE="$stub_dir/state"
+
+    CRONTAB="$stub_dir/crontab" \
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/install_cron.sh" \
+        --project-root "$AUTO_CLAUDE_REPO_ROOT"
+    [[ "$status" -eq 0 ]]
+    grep -Fq "auto-claude watchdog (managed)" "$FAKE_CRON_STATE"
+
+    # Second install should refuse without --force.
+    CRONTAB="$stub_dir/crontab" \
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/install_cron.sh" \
+        --project-root "$AUTO_CLAUDE_REPO_ROOT"
+    [[ "$status" -ne 0 ]]
+    [[ "$output" == *"already installed"* ]]
+}
+
+@test "install_cron.sh --force replaces an existing entry rather than appending" {
+    stub_dir="$TEST_REPO/fake-cron-force"
+    _install_cron_stub "$stub_dir"
+    export FAKE_CRON_STATE="$stub_dir/state"
+
+    # Build a minimal alternate project root so verify_project_root passes.
+    alt_root="$TEST_REPO/alt-project"
+    mkdir -p "$alt_root/scripts/auto_claude"
+    cat > "$alt_root/scripts/auto_claude/watchdog.sh" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+    chmod +x "$alt_root/scripts/auto_claude/watchdog.sh"
+
+    CRONTAB="$stub_dir/crontab" \
+    "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/install_cron.sh" \
+        --project-root "$AUTO_CLAUDE_REPO_ROOT" >/dev/null
+
+    # Snapshot first install — count of marker-fence lines (start + end)
+    n_first=$(grep -cF "auto-claude watchdog (managed)" "$FAKE_CRON_STATE")
+    [[ "$n_first" -eq 2 ]]   # exactly one fenced block: open + close
+
+    # Force-install with a different project root
+    CRONTAB="$stub_dir/crontab" \
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/install_cron.sh" \
+        --project-root "$alt_root" --force
+    [[ "$status" -eq 0 ]]
+
+    # Still exactly one block, no duplicate fence pair.
+    n_after=$(grep -cF "auto-claude watchdog (managed)" "$FAKE_CRON_STATE")
+    [[ "$n_after" -eq 2 ]]
+    grep -Fq "$alt_root" "$FAKE_CRON_STATE"
+}
+
+@test "install_cron.sh --uninstall is a safe no-op when nothing is installed" {
+    stub_dir="$TEST_REPO/fake-cron-noop"
+    _install_cron_stub "$stub_dir"
+    export FAKE_CRON_STATE="$stub_dir/state"
+
+    CRONTAB="$stub_dir/crontab" \
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/install_cron.sh" --uninstall
+    [[ "$status" -eq 0 ]]
+    [[ "$output" == *"no-op"* ]]
+}
+
+@test "install_cron.sh --uninstall removes only the watchdog block" {
+    stub_dir="$TEST_REPO/fake-cron-uninstall"
+    _install_cron_stub "$stub_dir"
+    export FAKE_CRON_STATE="$stub_dir/state"
+
+    # Pre-existing unrelated entry.
+    cat > "$FAKE_CRON_STATE" <<'CRON'
+# user's existing job
+*/5 * * * * /usr/bin/true
+CRON
+
+    CRONTAB="$stub_dir/crontab" \
+    "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/install_cron.sh" \
+        --project-root "$AUTO_CLAUDE_REPO_ROOT" >/dev/null
+
+    grep -Fq "auto-claude watchdog (managed)" "$FAKE_CRON_STATE"
+    grep -Fq "/usr/bin/true" "$FAKE_CRON_STATE"
+
+    CRONTAB="$stub_dir/crontab" \
+    "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/install_cron.sh" --uninstall >/dev/null
+
+    ! grep -Fq "auto-claude watchdog (managed)" "$FAKE_CRON_STATE"
+    grep -Fq "/usr/bin/true" "$FAKE_CRON_STATE"
+}
+
+@test "install_cron.sh --dry-run does not modify the crontab" {
+    stub_dir="$TEST_REPO/fake-cron-dry"
+    _install_cron_stub "$stub_dir"
+    export FAKE_CRON_STATE="$stub_dir/state"
+
+    CRONTAB="$stub_dir/crontab" \
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/install_cron.sh" \
+        --project-root "$AUTO_CLAUDE_REPO_ROOT" --dry-run
+    [[ "$status" -eq 0 ]]
+    [[ "$output" == *"[dry-run]"* ]]
+    [[ ! -s "$FAKE_CRON_STATE" ]]
 }

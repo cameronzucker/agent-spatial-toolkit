@@ -1,0 +1,28 @@
+[Unit]
+Description=auto-claude watchdog (one-shot supervisor for orchestrated Claude Code sessions)
+Documentation=file://@PROJECT_ROOT@/docs/auto-claude-design.md
+# Don't fail loudly if a tick can't run — the timer fires again later.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+WorkingDirectory=@PROJECT_ROOT@
+ExecStart=@PROJECT_ROOT@/scripts/auto_claude/watchdog.sh
+
+# PATH must include where gh, jq, flock, claude, git, setsid, and node live.
+# /usr/local/bin and the per-user npm bin cover most installs of `claude`.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/@USER@/.npm-global/bin:/home/@USER@/.local/bin
+Environment=HOME=/home/@USER@
+# Keep the user's locale so jq/awk handle UTF-8 correctly.
+Environment=LANG=C.UTF-8
+
+# Surface stdout/stderr to the journal — `journalctl --user -u claude-watchdog`.
+StandardOutput=journal
+StandardError=journal
+
+# A single watchdog tick should never run more than a few minutes in normal
+# operation; cap it so a runaway tick can't hold the unit forever.
+TimeoutStartSec=15min
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,25 @@
+# auto-claude watchdog — copy/paste into `crontab -e` (or use install_cron.sh).
+#
+# This is the fallback for hosts without user systemd. Prefer the systemd
+# unit + timer (systemd/claude-watchdog.{service,timer}.template) when
+# available — it integrates with journald and survives reboots cleanly.
+#
+# Cadence: every 20 min. The watchdog is idempotent and concurrency-safe
+# via flock; tighter cadences are fine but waste cycles.
+#
+# Required env: cron's environment is sparse. PATH must include where
+# gh, jq, flock, claude, git, setsid, and node live. Set HOME explicitly so
+# `gh` and `claude` find their auth (~/.config/gh, ~/.claude).
+#
+# Output redirect: cron's default is to mail the user. Redirect to a log
+# file under the project so it stays with the orchestrator.
+#
+# Note: install_cron.sh substitutes the project root and user before writing.
+# If you copy/paste manually, replace the project-root path in the cron line
+# below with the absolute path to your checkout.
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/@USER@/.npm-global/bin:/home/@USER@/.local/bin
+HOME=/home/@USER@
+
+# auto-claude watchdog
+*/20 * * * * cd @PROJECT_ROOT@ && ./scripts/auto_claude/watchdog.sh >> .handoff/logs/cron.log 2>&1

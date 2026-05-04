@@ -1,0 +1,36 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: uv sync --all-groups
+      - name: Run tests
+        run: |
+          set +e
+          uv run pytest -v
+          status=$?
+          # Exit code 5 == "no tests collected"; treat as success until tests exist.
+          if [ $status -eq 5 ]; then
+            echo "pytest collected no tests yet; treating as success."
+            exit 0
+          fi
+          exit $status
+      - name: Run linter
+        run: uv run ruff check .
+        continue-on-error: true

@@ -75,6 +75,45 @@ if [[ "$task_status" != "pending" ]]; then
     exit 1
 fi
 
+# Defense in depth (Addition 2 from today's collision analysis): probe for
+# sibling git worktrees of this same repo that have a fresh .handoff/.lock.
+# Two cases:
+#   - Sibling claims the SAME branch as the task we're about to lease. Git
+#     itself prevents two worktrees holding the same branch checked out, so
+#     this would already fail at `git checkout -b` later. We surface it
+#     loudly here too with `alert_sibling_branch_conflict` and refuse to
+#     proceed — it indicates either a stale sibling lock or a manual fixup
+#     gone wrong, and continuing would just race git.
+#   - Sibling holds a fresh lock on a DIFFERENT branch — concurrent
+#     orchestrator activity is a warning, not a hard stop. The sibling may
+#     legitimately be on an unrelated task. We emit
+#     `alert_sibling_orchestrator_active` and continue.
+if [[ -x "$SCRIPT_DIR/sibling_worktrees.sh" ]]; then
+    sibling_rows=$("$SCRIPT_DIR/sibling_worktrees.sh" list 2>/dev/null || true)
+    if [[ -n "$sibling_rows" ]]; then
+        # Hard stop on same-branch collision.
+        same_branch_path=""
+        while IFS=$'\t' read -r sib_path sib_branch _sib_age _sib_task _sib_session; do
+            [[ -z "$sib_path" ]] && continue
+            if [[ "$sib_branch" == "$task_branch" ]]; then
+                same_branch_path="$sib_path"
+                break
+            fi
+        done <<<"$sibling_rows"
+        if [[ -n "$same_branch_path" ]]; then
+            audit_event "alert_sibling_branch_conflict" "$(jq -cn \
+                --arg path "$same_branch_path" \
+                --arg branch "$task_branch" \
+                '{path:$path, branch:$branch, reason:"sibling_worktree_holds_same_branch"}')"
+            exit 1
+        fi
+        # Soft alert for any sibling activity (different branch).
+        audit_event "alert_sibling_orchestrator_active" "$(jq -cn \
+            --arg rows "$sibling_rows" \
+            '{rows:$rows, reason:"sibling_worktree_lock_fresh"}')"
+    fi
+fi
+
 # Acquire lock first (we use the not-yet-leased state as our marker).
 if ! acquire_lock "$SESSION_LOCK" "$task_id" "$task_branch" "leased"; then
     rc=$?

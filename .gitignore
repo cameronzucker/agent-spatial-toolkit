@@ -33,7 +33,11 @@ htmlcov/
 coverage.xml
 
 # Tooling artifacts
-.claude/
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
+.claude/hooks/*
+!.claude/hooks/auto_claude_session_brief.sh
 .superpowers/
 
 # Runtime annotation sessions (these belong to the user, not the repo)

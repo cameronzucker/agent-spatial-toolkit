@@ -714,6 +714,25 @@
                 // Enable Next once at least one photo has a solved pose.
                 var nextBtn = document.getElementById('phase-2c-next');
                 if (nextBtn) nextBtn.disabled = false;
+
+                // Append the wireframe overlay <img>. Removes any previous one
+                // first (after a re-click + re-solve, we want the new wireframe).
+                var oldWireframe = card.querySelector('.phase-2c-wireframe');
+                if (oldWireframe) oldWireframe.remove();
+                var wireframeImg = document.createElement('img');
+                wireframeImg.className = 'phase-2c-wireframe';
+                // Cache-bust so a retry's PNG isn't served from the browser cache.
+                wireframeImg.src = '/api/wireframe/' + encodeURIComponent(photoId) + '?t=' + Date.now();
+                wireframeImg.alt = 'wireframe for ' + photoId;
+                wireframeImg.onerror = function () {
+                    // Wireframe render can fail (e.g., missing photo file in dev fixtures).
+                    // Surface a small note rather than leaving a broken-image icon.
+                    var note = document.createElement('p');
+                    note.className = 'phase-2c-wireframe-note';
+                    note.textContent = '(wireframe render unavailable)';
+                    wireframeImg.replaceWith(note);
+                };
+                card.appendChild(wireframeImg);
             })
             .catch(function (err) {
                 clearChildren(resultEl);

@@ -166,6 +166,96 @@ def test_render_overlay_rejects_nan_pose() -> None:
         )
 
 
+def test_render_overlay_marker_scales_with_image_size(tmp_path: Path) -> None:
+    """Markers auto-scale: a 4000×3000 image gets larger markers than 1000×1000 (#19)."""
+    pose = _test_pose()
+
+    # --- small image (1000×1000) ---
+    small_path = tmp_path / "small.jpg"
+    Image.new("RGB", (1000, 1000), color=(100, 100, 100)).save(small_path)
+    small_intr = Intrinsics(
+        profile_source="fov_class_fallback",
+        profile_id="test",
+        fx_px=1000.0, fy_px=1000.0, cx=500.0, cy=500.0,
+        distortion=[0.0, 0.0, 0.0, 0.0, 0.0],
+    )
+    small_out = tmp_path / "small_overlay.png"
+    render_overlay(
+        photo_path=small_path,
+        out_path=small_out,
+        features=[("origin", np.array([0.0, 0.0, 0.0]))],
+        pose=pose,
+        intrinsics=small_intr,
+    )
+
+    # --- large image (4000×3000) ---
+    large_path = tmp_path / "large.jpg"
+    Image.new("RGB", (4000, 3000), color=(100, 100, 100)).save(large_path)
+    large_intr = Intrinsics(
+        profile_source="fov_class_fallback",
+        profile_id="test",
+        fx_px=4000.0, fy_px=4000.0, cx=2000.0, cy=1500.0,
+        distortion=[0.0, 0.0, 0.0, 0.0, 0.0],
+    )
+    large_out = tmp_path / "large_overlay.png"
+    render_overlay(
+        photo_path=large_path,
+        out_path=large_out,
+        features=[("origin", np.array([0.0, 0.0, 0.0]))],
+        pose=pose,
+        intrinsics=large_intr,
+    )
+
+    # Count non-background (marker) pixels around the projected center.
+    # The origin projects to the image center in both cases.
+    bg = np.array([100, 100, 100])
+
+    small_img = np.array(Image.open(small_out))
+    small_center = small_img.shape[0] // 2
+    small_region = small_img[
+        small_center - 30 : small_center + 30,
+        small_center - 30 : small_center + 30,
+    ]
+    small_marker_px = int(np.sum(np.any(small_region != bg, axis=-1)))
+
+    large_img = np.array(Image.open(large_out))
+    large_cy, large_cx = large_img.shape[0] // 2, large_img.shape[1] // 2
+    large_region = large_img[
+        large_cy - 30 : large_cy + 30,
+        large_cx - 30 : large_cx + 30,
+    ]
+    large_marker_px = int(np.sum(np.any(large_region != bg, axis=-1)))
+
+    # The large-image marker must cover strictly more pixels than the small one.
+    assert large_marker_px > small_marker_px, (
+        f"Expected larger marker on 4000×3000 image; got "
+        f"small={small_marker_px}px, large={large_marker_px}px"
+    )
+
+
+def test_render_overlay_explicit_radius_overrides_auto_scale(tmp_path: Path) -> None:
+    """Passing an explicit marker_radius_px bypasses auto-scaling."""
+    photo_path = _make_test_photo(tmp_path)
+    out_path = tmp_path / "overlay.png"
+    # Use a deliberately large radius; auto-scale for 1000×1000 would give ~6.
+    render_overlay(
+        photo_path=photo_path,
+        out_path=out_path,
+        features=[("origin", np.array([0.0, 0.0, 0.0]))],
+        pose=_test_pose(),
+        intrinsics=_test_intrinsics(),
+        marker_radius_px=40,
+    )
+    overlay = np.array(Image.open(out_path))
+    bg = np.array([100, 100, 100])
+    center = 500
+    region = overlay[center - 50 : center + 50, center - 50 : center + 50]
+    marker_px = int(np.sum(np.any(region != bg, axis=-1)))
+    # A 40px-radius circle should cover substantially more than a 6px one.
+    # Area of circle outline with r=40, thickness~10 ≫ 100 pixels.
+    assert marker_px > 200, f"Expected large marker footprint with radius=40; got {marker_px}px"
+
+
 def test_render_overlay_rejects_zero_focal() -> None:
     """Degenerate intrinsics (fx=0) must raise rather than draw at principal point."""
     intr_bad = Intrinsics(

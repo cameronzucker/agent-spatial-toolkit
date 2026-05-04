@@ -202,6 +202,56 @@ JSON
     [[ "$status" -ne 0 ]]
 }
 
+@test "state_set_task_pr survives pr_url containing double-quote (B3 jq injection)" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"pending","branch":"feat/t","attempts":0,"depends_on":[]}
+  ],
+  "current_lease": null
+}
+JSON
+    # Adversarial url with embedded quote and jq syntax — must survive intact.
+    nasty='https://example.com/pr"'\'') | .tasks[0].title = "PWNED" | (.'
+    run state_set_task_pr "TASK-1" 42 "$nasty"
+    [[ "$status" -eq 0 ]]
+    # The url should be stored verbatim, and title should NOT have been clobbered.
+    run jq -r '.tasks[0].pr_url' "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json"
+    [[ "$output" == "$nasty" ]]
+    run jq -r '.tasks[0].title' "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json"
+    [[ "$output" == "t" ]]
+    run jq -r '.tasks[0].pr_number' "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json"
+    [[ "$output" == "42" ]]
+}
+
+@test "state_set_task_pr rejects non-integer pr_number" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{"schema_version":1,"tasks":[{"id":"T","title":"t","status":"pending","branch":"b","attempts":0,"depends_on":[]}],"current_lease":null}
+JSON
+    run state_set_task_pr "T" "not-a-number" "https://x"
+    [[ "$status" -ne 0 ]]
+    run state_set_task_pr "T" '42); .tasks[0].title = "X' "https://x"
+    [[ "$status" -ne 0 ]]
+}
+
+@test "state_set_task_phase rejects unknown phase (B3 phase whitelist)" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{"schema_version":1,"tasks":[{"id":"T","title":"t","status":"pending","branch":"b","attempts":0,"depends_on":[]}],"current_lease":null}
+JSON
+    run state_set_task_phase "T" 'bogus_phase'
+    [[ "$status" -ne 0 ]]
+    # Adversarial value with jq syntax is also refused
+    run state_set_task_phase "T" 'editing"; .tasks=[]; .x="'
+    [[ "$status" -ne 0 ]]
+    # Valid phase still works
+    run state_set_task_phase "T" 'editing'
+    [[ "$status" -eq 0 ]]
+}
+
 @test "state_get_next_pending honors deps" {
     source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
     cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'

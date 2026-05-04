@@ -144,23 +144,11 @@ state_get_current_lease() {
     jq -c '.current_lease // null' "$(state_path)"
 }
 
-# Internal helper: mutate the task at id via a jq filter applied to that task,
-# then write back. The filter must be a valid jq expression that operates on
-# the task object (referenced as `.`).
-_state_mutate_task() {
-    local id="$1"
-    local filter="$2"
-    local sp
-    sp="$(state_path)"
-    local now
-    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    local new_json
-    new_json=$(jq --arg id "$id" --arg now "$now" \
-        '.tasks |= map(if .id == $id then ('"$filter"') | .updated_at = $now else . end)' \
-        "$sp")
-    [[ -n "$new_json" ]] || { echo "_state_mutate_task: empty result" >&2; return 1; }
-    _state_write "$new_json"
-}
+# Mutating helpers below NEVER interpolate runtime values into jq programs.
+# All values flow through `--arg` / `--argjson` so a `pr_url` containing `"`,
+# or a `phase` containing jq syntax (the implementer session is untrusted
+# code that calls these wrappers) cannot corrupt the filter or trigger
+# arbitrary jq expression evaluation against state.json.
 
 state_set_task_status() {
     local id="$1"
@@ -169,21 +157,68 @@ state_set_task_status() {
         pending|leased|in_progress|pr_open|blocked|done) ;;
         *) echo "state_set_task_status: invalid status '$status'" >&2; return 1 ;;
     esac
-    _state_mutate_task "$id" ".status = \"$status\""
+    local sp now new_json
+    sp="$(state_path)"
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    new_json=$(jq \
+        --arg id "$id" \
+        --arg status "$status" \
+        --arg now "$now" \
+        '.tasks |= map(if .id == $id then .status = $status | .updated_at = $now else . end)' \
+        "$sp") || return 1
+    [[ -n "$new_json" ]] || { echo "state_set_task_status: empty result" >&2; return 1; }
+    _state_write "$new_json"
 }
 
 state_set_task_phase() {
     local id="$1"
     local phase="$2"
-    _state_mutate_task "$id" ".phase = \"$phase\""
+    # phase comes from the implementer session — untrusted. Validate against
+    # the known set rather than blindly writing.
+    case "$phase" in
+        leased|branch_created|editing|tests_running|committing|pushing|pr_opening|pr_open|done|blocked)
+            ;;
+        *)
+            echo "state_set_task_phase: invalid phase '$phase'" >&2
+            return 1
+            ;;
+    esac
+    local sp now new_json
+    sp="$(state_path)"
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    new_json=$(jq \
+        --arg id "$id" \
+        --arg phase "$phase" \
+        --arg now "$now" \
+        '.tasks |= map(if .id == $id then .phase = $phase | .updated_at = $now else . end)' \
+        "$sp") || return 1
+    [[ -n "$new_json" ]] || { echo "state_set_task_phase: empty result" >&2; return 1; }
+    _state_write "$new_json"
 }
 
 state_set_task_pr() {
     local id="$1"
     local pr_number="$2"
     local pr_url="$3"
-    _state_mutate_task "$id" \
-        ".pr_number = $pr_number | .pr_url = \"$pr_url\" | .status = \"pr_open\""
+    # pr_number must be a non-negative integer; reject anything else so jq's
+    # --argjson doesn't blow up on non-numeric input (and so a value like
+    # `null) | .secret = ...` can't sneak through).
+    if ! [[ "$pr_number" =~ ^[0-9]+$ ]]; then
+        echo "state_set_task_pr: pr_number must be a non-negative integer (got '$pr_number')" >&2
+        return 1
+    fi
+    local sp now new_json
+    sp="$(state_path)"
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    new_json=$(jq \
+        --arg id "$id" \
+        --argjson pr_number "$pr_number" \
+        --arg pr_url "$pr_url" \
+        --arg now "$now" \
+        '.tasks |= map(if .id == $id then .pr_number = $pr_number | .pr_url = $pr_url | .status = "pr_open" | .updated_at = $now else . end)' \
+        "$sp") || return 1
+    [[ -n "$new_json" ]] || { echo "state_set_task_pr: empty result" >&2; return 1; }
+    _state_write "$new_json"
 }
 
 # state_acquire_lease <task_id> <session_id> <branch> <head_sha>

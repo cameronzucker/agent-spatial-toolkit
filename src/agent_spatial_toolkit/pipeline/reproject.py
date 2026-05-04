@@ -18,7 +18,7 @@ def render_overlay(
     features: list[tuple[str, np.ndarray]],  # (label, xyz_mm)
     pose: PoseResult,
     intrinsics: Intrinsics,
-    marker_radius_px: int = 12,
+    marker_radius_px: int | None = None,
     marker_color: tuple[int, int, int] = (255, 80, 200),  # BGR magenta
     label_color: tuple[int, int, int] = (255, 255, 255),
 ) -> Path:
@@ -54,6 +54,16 @@ def render_overlay(
     if img is None:
         raise FileNotFoundError(f"Cannot open image: {photo_path}")
 
+    # Scale marker geometry with image size so overlays stay visible on
+    # high-resolution photos (issue #19).  min(w,h) avoids oversized markers
+    # on ultra-wide images; the floor of 6 keeps markers visible on thumbnails.
+    h_img, w_img = img.shape[:2]
+    if marker_radius_px is None:
+        marker_radius_px = max(6, int(min(w_img, h_img) * 0.005))
+    marker_thickness = max(1, marker_radius_px // 4)
+    font_scale = max(0.4, marker_radius_px / 20.0)
+    font_thickness = max(1, marker_radius_px // 6)
+
     K = np.array(  # noqa: N806 — canonical CV name for camera matrix
         [
             [intrinsics.fx_px, 0, intrinsics.cx],
@@ -74,17 +84,24 @@ def render_overlay(
     for (label, _), (px, py) in zip(features, projected, strict=True):
         if not (0 <= px < img.shape[1] and 0 <= py < img.shape[0]):
             continue  # off-frame
-        cv2.circle(img, (int(px), int(py)), marker_radius_px, marker_color, 2, lineType=cv2.LINE_AA)
-        cv2.circle(img, (int(px), int(py)), 2, marker_color, -1)
+        cv2.circle(
+            img,
+            (int(px), int(py)),
+            marker_radius_px,
+            marker_color,
+            marker_thickness,
+            lineType=cv2.LINE_AA,
+        )
+        cv2.circle(img, (int(px), int(py)), max(1, marker_thickness), marker_color, -1)
         # Label slightly above and right of the marker
         cv2.putText(
             img,
             label,
             (int(px) + marker_radius_px + 4, int(py) - 4),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
+            font_scale,
             label_color,
-            2,
+            font_thickness,
             cv2.LINE_AA,
         )
 

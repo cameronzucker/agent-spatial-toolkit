@@ -527,6 +527,18 @@ def _register_routes(app: Flask) -> None:
             dict.fromkeys(auto_flags + list(mem.get("flags", [])) + list(caller_flags))
         )
 
+        # Read manifest.json (written by the CLI in PR #27) for sha256 + path.
+        # Manifest missing or corrupt is non-fatal: the server tolerates a
+        # no-CLI test/dev path by falling back to empty sha256 + a default
+        # path string.
+        manifest_path = session.session_dir / "manifest.json"
+        manifest_data: dict[str, dict[str, Any]] = {}
+        if manifest_path.is_file():
+            try:
+                manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                manifest_data = {}
+
         # Build SessionState from the in-memory state.
         photos_out: list[Photo] = []
         for photo_id, entry in mem["photos"].items():
@@ -539,11 +551,12 @@ def _register_routes(app: Flask) -> None:
                 )
                 for a in entry.get("anchors", [])
             ]
+            photo_meta = manifest_data.get(photo_id, {})
             photos_out.append(
                 Photo(
                     id=photo_id,
-                    path=f"photos/{photo_id}",
-                    sha256="",  # populated by upload pipeline in a later PR
+                    path=photo_meta.get("path", f"photos/{photo_id}"),
+                    sha256=photo_meta.get("sha256", ""),
                     camera_detected=CameraDetected(),
                     intrinsics=entry["intrinsics"],
                     pose=pose.to_dict() if isinstance(pose, PoseResult) else pose,

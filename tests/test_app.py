@@ -431,6 +431,33 @@ def test_state_includes_uploaded_photos(app_factory) -> None:
     assert test_photo["pose"] is None
 
 
+def test_finalize_reads_sha256_from_manifest(app_factory) -> None:
+    """When manifest.json is present, /api/finalize populates Photo.sha256 from it."""
+    app, session, _server = app_factory()
+    client = app.test_client()
+
+    # Write a fake manifest matching what the CLI would produce.
+    manifest = {
+        "top_down": {
+            "sha256": "deadbeef" * 8,  # 64 hex chars
+            "path": "photos/top_down",
+            "size_bytes": 12345,
+        },
+    }
+    (session.session_dir / "manifest.json").write_text(json.dumps(manifest))
+
+    # Solve PnP to register the photo in mem.
+    r = client.post("/api/anchors", json=_valid_anchors_payload())
+    assert r.status_code == 200, r.get_json()
+
+    r = client.post("/api/finalize", json={})
+    assert r.status_code == 200, r.get_json()
+
+    annotations = json.loads((session.session_dir / "annotations.json").read_text())
+    assert annotations["photos"][0]["sha256"] == "deadbeef" * 8
+    assert annotations["photos"][0]["path"] == "photos/top_down"
+
+
 def test_anchors_pose_failure_logs_to_events_with_safe_message(app_factory) -> None:
     """A PnP failure returns a stable client-safe message; full detail goes to events.jsonl."""
     app, session, _ = app_factory()

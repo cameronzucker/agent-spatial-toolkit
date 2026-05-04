@@ -28,6 +28,12 @@ source "$SCRIPT_DIR/lock_helpers.sh"
 # shellcheck source=state_helpers.sh
 source "$SCRIPT_DIR/state_helpers.sh"
 
+# Source state_helpers for state_set_task_status used in inspect_gh's
+# pr_open → done auto-update.
+if ! declare -f state_set_task_status >/dev/null 2>&1; then
+    source "$(dirname "$0")/state_helpers.sh"
+fi
+
 LOCK_PATH="$AUTO_CLAUDE_REPO_ROOT/.handoff/.lock"
 MAX_LOCK_AGE="${AUTO_CLAUDE_LOCK_MAX_AGE:-600}"
 
@@ -135,15 +141,45 @@ inspect_gh() {
         echo '{"open_prs":[],"fetched":false,"reason":"gh_not_installed"}'
         return
     fi
-    # Best-effort. gh may not be authenticated in test contexts; treat
-    # failures as "fetched=false" rather than aborting.
     local prs
     if prs=$(cd "$AUTO_CLAUDE_REPO_ROOT" && gh pr list --state open \
                 --json number,title,headRefName,url 2>/dev/null); then
+        # Auto-reconcile state.json: any pr_open task whose PR number is no
+        # longer in the open list AND whose PR is MERGED gets bumped to done.
+        # Without this, dependent tasks (depends_on: [TASK-X]) never become
+        # eligible because the dependency check requires status == "done".
+        # Caught in 2026-05-04 deploy: TASK-MARKER-SCALE waited indefinitely
+        # for TASK-DRY-CAMERA's status to flip even after PR #41 merged.
+        _reconcile_merged_prs "$prs"
         jq -cn --argjson prs "$prs" '{open_prs:$prs, fetched:true}'
     else
         echo '{"open_prs":[],"fetched":false,"reason":"gh_call_failed"}'
     fi
+}
+
+_reconcile_merged_prs() {
+    local open_prs="$1"
+    local sp
+    sp="$(state_path)"
+    [[ -f "$sp" ]] || return 0
+    local pr_open_tasks
+    pr_open_tasks=$(jq -c '.tasks[]? | select(.status == "pr_open" and .pr_number != null) | {id, pr_number}' "$sp" 2>/dev/null)
+    [[ -z "$pr_open_tasks" ]] && return 0
+    while IFS= read -r task; do
+        [[ -z "$task" ]] && continue
+        local task_id pr_number still_open pr_state
+        task_id=$(jq -r '.id' <<<"$task")
+        pr_number=$(jq -r '.pr_number' <<<"$task")
+        still_open=$(jq --argjson n "$pr_number" 'any(.[]; .number == $n)' <<<"$open_prs")
+        if [[ "$still_open" == "false" ]]; then
+            pr_state=$(cd "$AUTO_CLAUDE_REPO_ROOT" && gh pr view "$pr_number" --json state --jq '.state' 2>/dev/null) || continue
+            if [[ "$pr_state" == "MERGED" ]]; then
+                if state_set_task_status "$task_id" "done" 2>/dev/null; then
+                    audit_event "task_status_auto_done" "$(jq -cn --arg id "$task_id" --arg pr "$pr_number" '{task_id:$id, pr_number:($pr|tonumber)}')"
+                fi
+            fi
+        fi
+    done <<<"$pr_open_tasks"
 }
 
 inspect_state_file() {

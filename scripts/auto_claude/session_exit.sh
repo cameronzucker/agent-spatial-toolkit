@@ -161,6 +161,22 @@ if (( tests_evidence == 0 )); then
     gate_failures+=("no_tests_passed_marker")
 fi
 
+# Ruff gate: if pyproject.toml is present and uv+ruff are available, the
+# session must pass ruff format --check + ruff check before classification
+# as pr_open. Caught in the first live deploy (2026-05-04): the ruff CI
+# check added in PR #40 caused 3 of 3 watchdog-shipped PRs (#41, #43) to
+# fail CI on trivial format/import-sort issues that needed manual fixup.
+if [[ -f "$AUTO_CLAUDE_REPO_ROOT/pyproject.toml" ]] && command -v uv >/dev/null 2>&1; then
+    if ! (cd "$AUTO_CLAUDE_REPO_ROOT" && uv run ruff format --check . >/dev/null 2>&1); then
+        gate_ok=0
+        gate_failures+=("ruff_format_check_failed")
+    fi
+    if ! (cd "$AUTO_CLAUDE_REPO_ROOT" && uv run ruff check . >/dev/null 2>&1); then
+        gate_ok=0
+        gate_failures+=("ruff_check_failed")
+    fi
+fi
+
 # Determine final_status
 final_status="pending"
 if (( in_recovery )); then
@@ -198,6 +214,16 @@ state_release_lease "$task_id" "$session_id" "$final_status" || {
 # Consume the tests-passed marker so a future retry of the same task must
 # re-establish that tests pass on its own work.
 rm -f "$tests_marker"
+
+# Restore working tree to main so the next watchdog tick doesn't fire
+# alert_dirty_at_boot. Only switch if the tree is clean (uncommitted work
+# signals a broken session that needs human attention — leave it for
+# inspection rather than auto-discarding).
+if [[ -z "$(cd "$AUTO_CLAUDE_REPO_ROOT" && git status --porcelain=v2 2>/dev/null | grep -E '^[12u]' || true)" ]]; then
+    if ! (cd "$AUTO_CLAUDE_REPO_ROOT" && git checkout main >/dev/null 2>&1); then
+        audit_event "session_exit_warning" '{"reason":"checkout_main_failed"}'
+    fi
+fi
 
 # Reflog snapshot at exit
 exit_snap="$REFLOG_DIR/exit-$(date -u +%Y%m%dT%H%M%SZ)-$session_id.reflog"

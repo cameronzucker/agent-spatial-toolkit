@@ -680,10 +680,9 @@
             }
         }
         // No lens_id picked → server returns 400; surface as a clear error.
-
-        // Increment attempt counter before fetch so failed solves also
-        // consume from the retry budget (spec §3 Phase 2c: 1 retry max).
-        state.attempts += 1;
+        // (state.attempts is incremented inside the success branch below
+        // when intrinsics_suspect=true — spec §3 Phase 2c counts retry-on-RMS,
+        // not retry-on-any-error. Failed POSTs don't burn the budget.)
 
         var solveBtn = card.querySelector('.phase-2c-solve-btn');
         if (solveBtn) solveBtn.disabled = true;
@@ -722,8 +721,13 @@
 
                 // Append the wireframe overlay <img>. Removes any previous one
                 // first (after a re-click + re-solve, we want the new wireframe).
+                // Also remove any stale wireframe-note from a previous failed
+                // render — otherwise the note would still be visible after a
+                // successful retry.
                 var oldWireframe = card.querySelector('.phase-2c-wireframe');
                 if (oldWireframe) oldWireframe.remove();
+                var oldWireframeNote = card.querySelector('.phase-2c-wireframe-note');
+                if (oldWireframeNote) oldWireframeNote.remove();
                 var wireframeImg = document.createElement('img');
                 wireframeImg.className = 'phase-2c-wireframe';
                 // Cache-bust so a retry's PNG isn't served from the browser cache.
@@ -744,6 +748,12 @@
                 if (oldControls) oldControls.remove();
 
                 if (suspect) {
+                    // Count this suspect solve toward the retry budget. Only
+                    // suspect solves count — failed POSTs (network, missing
+                    // lens, PnP error) don't burn the budget, per spec §3
+                    // Phase 2c "retry-on-RMS, not retry-on-any-request".
+                    state.attempts += 1;
+
                     var controls = document.createElement('div');
                     controls.className = 'phase-2c-retry-controls';
 

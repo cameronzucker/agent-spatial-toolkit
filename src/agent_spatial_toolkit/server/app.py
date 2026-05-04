@@ -687,9 +687,11 @@ def _register_routes(app: Flask) -> None:
         (i.e. ``/api/anchors`` has been POSTed for it). Path traversal is
         blocked via ``secure_filename`` + parent-resolution check.
 
-        When no photo file is found on disk the endpoint synthesises a blank
-        image from the stored ``image_size`` so the test fixture (which only
-        POSTs anchors without uploading a file) still receives a valid PNG.
+        Returns 404 when the source photo file is missing on disk — the
+        wireframe's purpose is visual confirmation against the actual photo,
+        so synthesizing a blank fallback would silently undermine that. The
+        wireframe test in tests/test_app.py seeds a real photo file in the
+        session before POSTing anchors.
         """
         from werkzeug.utils import secure_filename
 
@@ -751,19 +753,9 @@ def _register_routes(app: Flask) -> None:
             {"id": f"a{i}", "xyz": a["pcb_xyz_mm"]} for i, a in enumerate(anchors_list)
         ]
 
-        # Determine the photo path — synthesise a blank image when no file
-        # exists on disk so the endpoint is testable without a real upload.
-        if safe_candidates:
-            photo_path = safe_candidates[0]
-        else:
-            image_size = photo_state.get("image_size", (640, 480))
-            w, h = image_size[0], image_size[1]
-            synth_path = wireframes_dir / f"{safe_id}_blank.jpg"
-            blank = np.zeros((h, w, 3), dtype=np.uint8)
-            import cv2 as _cv2
-
-            _cv2.imwrite(str(synth_path), blank)
-            photo_path = synth_path
+        if not safe_candidates:
+            return jsonify({"error": f"photo file for {safe_id} not found on disk"}), 404
+        photo_path = safe_candidates[0]
 
         try:
             render_wireframe(

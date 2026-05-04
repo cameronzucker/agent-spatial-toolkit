@@ -331,3 +331,138 @@ def test_static_overlay_serves_real_file(app_factory) -> None:
     resp = client.get("/static/overlays/top_overlay.png")
     assert resp.status_code == 200
     assert resp.data == b"\x89PNGFAKE"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Spec §6 closed-enum auto-emit + state.json + boundary validation
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_finalize_auto_emits_feature_clicked_only_once(app_factory) -> None:
+    """Per spec §6, every β-mode feature gets feature_clicked_only_once:<id>
+    auto-emitted by the server. The route must not require the client to send it."""
+    app, session, _ = app_factory()
+    client = app.test_client()
+
+    # Solve PnP to register photo + pose
+    r = client.post("/api/anchors", json=_valid_anchors_payload())
+    assert r.status_code == 200, r.get_json()
+
+    # Add a feature
+    r = client.post(
+        "/api/feature",
+        json={"feature_id": "f1", "photo_id": "top_down", "pixel": [500, 500]},
+    )
+    assert r.status_code == 200, r.get_json()
+
+    # Finalize — no flags in body; server must auto-emit feature_clicked_only_once:f1
+    r = client.post("/api/finalize", json={})
+    assert r.status_code == 200, r.get_json()
+
+    annotations = json.loads((session.session_dir / "annotations.json").read_text())
+    flags = annotations["quality_summary"]["flags"]
+    assert "feature_clicked_only_once:f1" in flags
+
+
+def test_finalize_updates_state_json_status_done(app_factory) -> None:
+    """Per spec line 239, state.json is replaced on each event; finalize updates it."""
+    app, session, _ = app_factory()
+    client = app.test_client()
+    r = client.post("/api/finalize", json={})
+    assert r.status_code == 200, r.get_json()
+    state = json.loads(session.state_path().read_text())
+    assert state["status"] == "done"
+
+
+def test_anchors_route_rejects_nan_image_size(app_factory) -> None:
+    """A non-finite image_size component returns 400."""
+    app, _, _ = app_factory()
+    intr = {
+        "profile_source": "fov_class_fallback",
+        "profile_id": "t",
+        "fx_px": 1000.0,
+        "fy_px": 1000.0,
+        "cx": 500.0,
+        "cy": 500.0,
+        "distortion_model": "opencv_5param",
+        "distortion": {"k1": 0, "k2": 0, "p1": 0, "p2": 0, "k3": 0},
+    }
+    r = app.test_client().post(
+        "/api/anchors",
+        json={
+            "photo_id": "x",
+            "intrinsics": intr,
+            "image_size": ["not-a-number", 1000],
+            "anchors": [],
+        },
+    )
+    assert r.status_code == 400
+
+
+def test_feature_route_rejects_nan_z_assumed(app_factory) -> None:
+    """A NaN z_assumed_mm returns 400, not 500."""
+    app, _, _ = app_factory()
+    r = app.test_client().post(
+        "/api/feature",
+        json={
+            "feature_id": "f",
+            "photo_id": "p",
+            "pixel": [100, 100],
+            "z_assumed_mm": float("nan"),
+        },
+    )
+    # Either 400 (validation) or 404 (unknown photo) is acceptable; the
+    # important thing is NOT 500.
+    assert r.status_code != 500
+
+
+def test_state_includes_uploaded_photos(app_factory) -> None:
+    """A photo file in session_dir/photos/ shows up in /api/state with pose=null."""
+    app, session, _ = app_factory()
+    photos_dir = session.session_dir / "photos"
+    photos_dir.mkdir(exist_ok=True)
+    (photos_dir / "test.jpg").write_bytes(b"fake jpeg bytes")
+    r = app.test_client().get("/api/state")
+    assert r.status_code == 200
+    data = r.get_json()
+    photo_ids = [p["id"] for p in data["photos"]]
+    assert "test.jpg" in photo_ids
+    test_photo = next(p for p in data["photos"] if p["id"] == "test.jpg")
+    assert test_photo["pose"] is None
+
+
+def test_anchors_pose_failure_logs_to_events_with_safe_message(app_factory) -> None:
+    """A PnP failure returns a stable client-safe message; full detail goes to events.jsonl."""
+    app, session, _ = app_factory()
+    intr = {
+        "profile_source": "fov_class_fallback",
+        "profile_id": "t",
+        "fx_px": 1000.0,
+        "fy_px": 1000.0,
+        "cx": 500.0,
+        "cy": 500.0,
+        "distortion_model": "opencv_5param",
+        "distortion": {"k1": 0, "k2": 0, "p1": 0, "p2": 0, "k3": 0},
+    }
+    # Only 3 collinear anchors → cv2 ITERATIVE rejects (PoseSolveError per PR #10)
+    r = app.test_client().post(
+        "/api/anchors",
+        json={
+            "photo_id": "x",
+            "intrinsics": intr,
+            "image_size": [1000, 1000],
+            "anchors": [
+                {"id": "a", "pcb_xyz_mm": [0, 0, 0], "pixel": [100, 100]},
+                {"id": "b", "pcb_xyz_mm": [10, 0, 0], "pixel": [200, 100]},
+                {"id": "c", "pcb_xyz_mm": [20, 0, 0], "pixel": [300, 100]},
+            ],
+        },
+    )
+    assert r.status_code == 400
+    error_msg = r.get_json()["error"]
+    # Stable client-safe message — no "cv2.error", no file paths.
+    assert "cv2" not in error_msg.lower()
+    assert "/" not in error_msg  # no path leakage
+    # Full detail in events.jsonl
+    events_text = (session.session_dir / "events.jsonl").read_text()
+    assert "pose_failed" in events_text

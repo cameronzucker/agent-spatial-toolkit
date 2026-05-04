@@ -31,6 +31,8 @@ Design notes
 
 from __future__ import annotations
 
+import json
+import math
 import threading
 import time
 from pathlib import Path
@@ -72,6 +74,39 @@ class _ShutdownableServer(Protocol):
 # ─────────────────────────────────────────────────────────────────────────
 
 
+def _coerce_finite_int(value: Any, field: str) -> int:
+    """Coerce ``value`` to ``int``, raising ``ValueError`` with field context.
+
+    Rejects NaN, ±Inf, and anything that doesn't cleanly cast. The HTTP
+    routes catch ``ValueError`` and surface 400, so this keeps non-finite
+    inputs from leaking into pose.py / ray.py and surfacing as 500.
+    """
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{field} must be an integer; got {value!r}") from e
+    # ``int`` itself is always finite, but guard against bool/float-derived
+    # values that round-tripped via numpy etc.
+    if not math.isfinite(result):
+        raise ValueError(f"{field} must be finite; got {value!r}")
+    return result
+
+
+def _coerce_finite_float(value: Any, field: str) -> float:
+    """Coerce ``value`` to ``float``, raising ``ValueError`` on non-finite.
+
+    Mirror of :func:`_coerce_finite_int` for floating-point fields. NaN/Inf
+    are rejected explicitly so the API boundary returns 400, not 500.
+    """
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{field} must be a number; got {value!r}") from e
+    if not math.isfinite(result):
+        raise ValueError(f"{field} must be finite; got {value!r}")
+    return result
+
+
 def _intrinsics_from_dict(d: dict[str, Any]) -> Intrinsics:
     """Reconstruct an Intrinsics dataclass from its to_dict() shape.
 
@@ -81,19 +116,22 @@ def _intrinsics_from_dict(d: dict[str, Any]) -> Intrinsics:
     as a method on ``Intrinsics`` to avoid a cross-cutting change in PR #8.
     """
     distortion_dict = d["distortion"]
+    # Reject NaN/Inf at the boundary — without this the failure surfaces
+    # deep in pose.py / ray.py as a generic 500. Each numeric field carries
+    # its own context label so the 400 message is actionable.
     return Intrinsics(
         profile_source=d["profile_source"],
         profile_id=d["profile_id"],
-        fx_px=float(d["fx_px"]),
-        fy_px=float(d["fy_px"]),
-        cx=float(d["cx"]),
-        cy=float(d["cy"]),
+        fx_px=_coerce_finite_float(d["fx_px"], "intrinsics.fx_px"),
+        fy_px=_coerce_finite_float(d["fy_px"], "intrinsics.fy_px"),
+        cx=_coerce_finite_float(d["cx"], "intrinsics.cx"),
+        cy=_coerce_finite_float(d["cy"], "intrinsics.cy"),
         distortion=[
-            float(distortion_dict["k1"]),
-            float(distortion_dict["k2"]),
-            float(distortion_dict["p1"]),
-            float(distortion_dict["p2"]),
-            float(distortion_dict["k3"]),
+            _coerce_finite_float(distortion_dict["k1"], "intrinsics.distortion.k1"),
+            _coerce_finite_float(distortion_dict["k2"], "intrinsics.distortion.k2"),
+            _coerce_finite_float(distortion_dict["p1"], "intrinsics.distortion.p1"),
+            _coerce_finite_float(distortion_dict["p2"], "intrinsics.distortion.p2"),
+            _coerce_finite_float(distortion_dict["k3"], "intrinsics.distortion.k3"),
         ],
         distortion_model=d.get("distortion_model", "opencv_5param"),
         profile_calibration_rms_px=d.get("profile_calibration_rms_px"),
@@ -144,15 +182,56 @@ def _safe_static_send(base_dir: Path, requested_id: str) -> Any:
 
 
 def _state_snapshot(session: Session, mem: dict[str, Any]) -> dict[str, Any]:
-    """Build the JSON shape returned by ``GET /api/state``."""
+    """Build the JSON shape returned by ``GET /api/state``.
+
+    Includes uploaded-but-not-yet-anchored photos by scanning
+    ``session_dir/photos/`` so the wizard's Phase 2c can render them for
+    anchor-clicking. ``pose=null`` differentiates "uploaded only" from
+    "anchored" (pose populated).
+    """
+    photos_dir = session.session_dir / "photos"
+    uploaded: list[str] = []
+    if photos_dir.is_dir():
+        for entry in sorted(photos_dir.iterdir()):
+            if entry.is_file():
+                uploaded.append(entry.name)
+
     photos_out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    # First, surface all photos on disk (with or without pose).
+    for filename in uploaded:
+        seen.add(filename)
+        photo_entry = mem["photos"].get(filename, {})
+        pose = photo_entry.get("pose")
+        photos_out.append(
+            {
+                "id": filename,
+                "url": f"/static/photos/{filename}",
+                "intrinsics": photo_entry.get("intrinsics"),
+                "pose": pose.to_dict() if isinstance(pose, PoseResult) else None,
+                "intrinsics_suspect": (
+                    pose.intrinsics_suspect if isinstance(pose, PoseResult) else None
+                ),
+                "image_size": (
+                    list(photo_entry["image_size"]) if "image_size" in photo_entry else None
+                ),
+            }
+        )
+    # Then any in-memory photos that don't correspond to a file on disk yet
+    # (e.g. tests that POST /api/anchors without uploading a photo file).
     for photo_id, entry in mem["photos"].items():
+        if photo_id in seen:
+            continue
         pose = entry.get("pose")
         photos_out.append(
             {
                 "id": photo_id,
+                "url": f"/static/photos/{photo_id}",
                 "intrinsics": entry.get("intrinsics"),
                 "pose": pose.to_dict() if isinstance(pose, PoseResult) else None,
+                "intrinsics_suspect": (
+                    pose.intrinsics_suspect if isinstance(pose, PoseResult) else None
+                ),
                 "image_size": list(entry["image_size"]) if "image_size" in entry else None,
             }
         )
@@ -276,19 +355,31 @@ def _register_routes(app: Flask) -> None:
         except (KeyError, TypeError, ValueError) as e:
             return jsonify({"error": f"invalid anchor entries: {e}"}), 400
 
-        image_size = (int(image_size_in[0]), int(image_size_in[1]))
+        try:
+            image_size = (
+                _coerce_finite_int(image_size_in[0], "image_size[0]"),
+                _coerce_finite_int(image_size_in[1], "image_size[1]"),
+            )
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
 
         try:
             pose = solve_pnp(world_points, pixel_points, intrinsics, image_size)
         except PoseSolveError as e:
+            # Verbose detail goes to events.jsonl for debugging; the client
+            # gets a stable, message that doesn't leak cv2.error text or
+            # source-file paths (per app.py module docstring).
             event_log.write(
                 {
                     "type": "pose_failed",
                     "photo_id": photo_id,
-                    "error": str(e),
+                    "error_detail": str(e),
                 }
             )
-            return jsonify({"error": str(e)}), 400
+            return (
+                jsonify({"error": "PnP failed: anchors are degenerate or insufficient"}),
+                400,
+            )
         except Exception:
             return jsonify({"error": "internal error during pose solve"}), 500
 
@@ -342,7 +433,10 @@ def _register_routes(app: Flask) -> None:
         except (KeyError, TypeError):
             return jsonify({"error": "missing required field (feature_id, photo_id, pixel)"}), 400
 
-        z_assumed_mm = float(body.get("z_assumed_mm", 0.0))
+        try:
+            z_assumed_mm = _coerce_finite_float(body.get("z_assumed_mm", 0.0), "z_assumed_mm")
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
 
         photo_entry = mem["photos"].get(photo_id)
         if photo_entry is None:
@@ -398,11 +492,40 @@ def _register_routes(app: Flask) -> None:
         mem: dict[str, Any] = app.config["STATE"]
 
         body = request.get_json(silent=True) or {}
-        extra_flags = body.get("flags", []) if isinstance(body, dict) else []
-        if not isinstance(extra_flags, list):
+        caller_flags = body.get("flags", []) if isinstance(body, dict) else []
+        if not isinstance(caller_flags, list):
             return jsonify({"error": "flags must be a list"}), 400
 
-        all_flags = list(mem.get("flags", [])) + list(extra_flags)
+        # Auto-derive spec-mandated closed-enum flags (spec §6 line 458 —
+        # "Implementations MUST emit only these strings"; the server, not
+        # the client, is responsible for emitting them).
+        auto_flags: list[str] = []
+
+        # Every β-mode feature ⇒ feature_clicked_only_once:<feature_id>.
+        # In v0.1.0-alpha all features are β-mode (single-photo) by design.
+        for feature_id, _entry in mem["features"].items():
+            auto_flags.append(f"feature_clicked_only_once:{feature_id}")
+
+        # Any photo with intrinsics_suspect=True ⇒ session-wide
+        # intrinsics_suspect_high_anchor_rms (spec §6 line 462).
+        suspect_photos = [
+            pid
+            for pid, p in mem["photos"].items()
+            if isinstance(p.get("pose"), PoseResult) and p["pose"].intrinsics_suspect
+        ]
+        if suspect_photos:
+            auto_flags.append("intrinsics_suspect_high_anchor_rms")
+
+        # ≥2 suspect photos ⇒ intrinsics_session_recommend_chessboard
+        # (spec §6 line 464 / §5.2 "session-wide auto-promotion recommendation").
+        if len(suspect_photos) >= 2:
+            auto_flags.append("intrinsics_session_recommend_chessboard")
+
+        # Merge: server-derived auto-flags + in-memory accumulated flags +
+        # caller-supplied. Dedupe via dict-of-keys preserving order.
+        all_flags = list(
+            dict.fromkeys(auto_flags + list(mem.get("flags", [])) + list(caller_flags))
+        )
 
         # Build SessionState from the in-memory state.
         photos_out: list[Photo] = []
@@ -485,6 +608,18 @@ def _register_routes(app: Flask) -> None:
         tmp_status.write_text('{"status": "done"}\n', encoding="utf-8")
         tmp_status.replace(status_path)
         session.status = "done"
+
+        # Update state.json to reflect the terminal status (spec line 239 —
+        # "live session, replaced on each event"; finalize is the most
+        # consequential event). Without this, a wizard interruption + reload
+        # after finalize would still see status="in_progress".
+        state_path = session.state_path()
+        tmp_state = state_path.with_suffix(state_path.suffix + ".tmp")
+        tmp_state.write_text(
+            json.dumps(session.to_state_dict(), indent=2) + "\n",
+            encoding="utf-8",
+        )
+        tmp_state.replace(state_path)
 
         event_log.write({"type": "finalized", "annotations_path": str(out_path)})
 

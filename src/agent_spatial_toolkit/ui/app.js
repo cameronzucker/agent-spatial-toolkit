@@ -27,20 +27,8 @@
 (function () {
     'use strict';
 
-    // Lens dropdown options. Placeholder until the backend exposes a
-    // calibrated lens catalog (issue #4 hygiene territory). The first
-    // entry is a sentinel; the rest cover the cameras the spec's
-    // CHECKPOINT 1 setup uses (Pi 5 camera + iPhone). The "other" entry
-    // signals manual entry mode for a future intrinsics-override flow.
-    var LENS_OPTIONS = [
-        { value: '', label: '— Select lens —' },
-        { value: 'pi_camera_module_3_wide', label: 'Pi Camera Module 3 (wide)' },
-        { value: 'pi_camera_module_3_standard', label: 'Pi Camera Module 3 (standard)' },
-        { value: 'iphone_15_pro_24mm', label: 'iPhone 15 Pro — 24mm equiv (main)' },
-        { value: 'iphone_15_pro_13mm', label: 'iPhone 15 Pro — 13mm equiv (ultrawide)' },
-        { value: 'iphone_15_pro_77mm', label: 'iPhone 15 Pro — 77mm equiv (telephoto)' },
-        { value: 'other', label: 'Other (manual entry)' },
-    ];
+    // Lens catalog comes from GET /api/lens_catalog (Task 1.D.5 PR-α);
+    // fetched at init and stored on window.spatialState.lensCatalog.
 
     // View-label dropdown options per spec §3 Phase 2a line 157:
     // "top-down", "long-edge-A", "side-iso", "other". Order preserved
@@ -94,14 +82,25 @@
         // a failed state fetch would brick the Next button (no listener
         // attached) and trap the user in Phase 2a forever.
         wirePhaseControls();
-        fetch('/api/state')
-            .then(function (r) {
-                if (!r.ok) {
-                    throw new Error('GET /api/state returned ' + r.status);
-                }
+        // Fetch lens catalog + state in parallel. Catalog drives the lens
+        // dropdown options in Phase 2a thumbnails (replaces the static
+        // LENS_OPTIONS that lived here in 1.D.3); state drives initial
+        // thumbnail render. Both must be available before renderThumbnails
+        // because the lens select is built from the catalog.
+        Promise.all([
+            fetch('/api/lens_catalog').then(function (r) {
+                if (!r.ok) throw new Error('GET /api/lens_catalog returned ' + r.status);
                 return r.json();
-            })
-            .then(function (state) {
+            }),
+            fetch('/api/state').then(function (r) {
+                if (!r.ok) throw new Error('GET /api/state returned ' + r.status);
+                return r.json();
+            }),
+        ])
+            .then(function (results) {
+                var catalogResp = results[0];
+                var state = results[1];
+                window.spatialState.lensCatalog = catalogResp.lenses || [];
                 renderThumbnails(state.photos || []);
             })
             .catch(function (err) {
@@ -166,7 +165,8 @@
         exifInfo.textContent = 'Reading EXIF…';
         meta.appendChild(exifInfo);
 
-        meta.appendChild(buildLabeledSelect('Lens', 'lens-select', LENS_OPTIONS, function (val) {
+        var lensOptions = lensCatalogToOptions(window.spatialState.lensCatalog);
+        meta.appendChild(buildLabeledSelect('Lens', 'lens-select', lensOptions, function (val) {
             window.spatialState.photos[photo.id].lens = val;
         }));
 
@@ -199,6 +199,24 @@
         wrapper.appendChild(select);
 
         return wrapper;
+    }
+
+    // Convert the /api/lens_catalog response into the {value, label} option
+    // shape buildLabeledSelect expects. Always prepends a placeholder option
+    // so a user-unselected dropdown has a stable default.
+    function lensCatalogToOptions(catalog) {
+        var opts = [{ value: '', label: '— Select lens —' }];
+        (catalog || []).forEach(function (entry) {
+            // Suffix non-resolvable entries so users see why a lens choice
+            // might fail at /api/anchors time. Catalog server already includes
+            // a `notes` field; we just hint here in the label.
+            var label = entry.label;
+            if (!entry.resolvable && entry.id !== 'exif:detected' && entry.id !== 'other') {
+                label += ' (calibration required)';
+            }
+            opts.push({ value: entry.id, label: label });
+        });
+        return opts;
     }
 
     function populateExif(photo, card) {

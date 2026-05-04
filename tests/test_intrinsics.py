@@ -2,9 +2,19 @@
 
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
-from agent_spatial_toolkit.pipeline.intrinsics import extract_exif_camera_info
+from agent_spatial_toolkit.pipeline.intrinsics import (
+    FOV_CLASS_NORMAL,
+    FOV_CLASS_TELEPHOTO,
+    FOV_CLASS_ULTRAWIDE,
+    FOV_CLASS_WIDE,
+    Intrinsics,
+    extract_exif_camera_info,
+    resolve_fallback_intrinsics,
+    resolve_fov_class,
+)
 
 
 def _make_jpeg_with_exif(tmp_path: Path, exif_dict: dict) -> Path:
@@ -109,3 +119,85 @@ def test_extract_exif_unknown_format_returns_none(tmp_path: Path) -> None:
     bad.write_bytes(b"this is not an image")
     info = extract_exif_camera_info(bad)
     assert info is None
+
+
+@pytest.mark.parametrize(
+    "focal_35mm,expected_class",
+    [
+        (10, FOV_CLASS_ULTRAWIDE),
+        (21, FOV_CLASS_ULTRAWIDE),
+        (22, FOV_CLASS_WIDE),
+        (28, FOV_CLASS_WIDE),
+        (34, FOV_CLASS_WIDE),
+        (35, FOV_CLASS_NORMAL),
+        (50, FOV_CLASS_NORMAL),
+        (69, FOV_CLASS_NORMAL),
+        (70, FOV_CLASS_TELEPHOTO),
+        (135, FOV_CLASS_TELEPHOTO),
+        (300, FOV_CLASS_TELEPHOTO),
+    ],
+)
+def test_resolve_fov_class(focal_35mm: float, expected_class: str) -> None:
+    """FOV-class boundaries match spec §5.2."""
+    assert resolve_fov_class(focal_35mm) == expected_class
+
+
+def test_resolve_fov_class_none_returns_none() -> None:
+    """No focal length → no class."""
+    assert resolve_fov_class(None) is None
+
+
+def test_resolve_fallback_intrinsics_telephoto() -> None:
+    """A telephoto lens gets near-zero distortion."""
+    intrinsics = resolve_fallback_intrinsics(
+        focal_length_35mm_equiv=85.0,
+        image_size=(4032, 3024),
+    )
+    assert intrinsics is not None
+    assert intrinsics.profile_source == "fov_class_fallback"
+    # Telephoto profile: zero distortion
+    assert intrinsics.distortion == [0.0, 0.0, 0.0, 0.0, 0.0]
+    # Principal point at image center
+    assert intrinsics.cx == pytest.approx(2016.0)
+    assert intrinsics.cy == pytest.approx(1512.0)
+
+
+def test_resolve_fallback_intrinsics_ultrawide_rejects() -> None:
+    """An ultrawide lens triggers a rejection (returns None with rejection flag)."""
+    intrinsics = resolve_fallback_intrinsics(
+        focal_length_35mm_equiv=14.0,
+        image_size=(4032, 3024),
+    )
+    assert intrinsics is None  # rejected — caller must check focal length first
+
+
+def test_resolve_fallback_intrinsics_normal_focal() -> None:
+    """A normal-focal photo gets mild distortion + correct fx/fy from focal length."""
+    intrinsics = resolve_fallback_intrinsics(
+        focal_length_35mm_equiv=50.0,
+        image_size=(4032, 3024),
+    )
+    assert intrinsics is not None
+    # 50mm equiv on 4032px wide sensor: fx = 50/36 * 4032 = 5600 px
+    # (using 36mm reference width for 35mm-equivalent)
+    assert intrinsics.fx_px == pytest.approx(5600.0, rel=0.01)
+    # Mild distortion for "normal" class
+    assert intrinsics.distortion[0] != 0.0  # k1 nonzero
+
+
+def test_intrinsics_dataclass_serializes_to_dict() -> None:
+    """Intrinsics has a to_dict() method matching the spec §6 schema shape."""
+    intrinsics = Intrinsics(
+        profile_source="fov_class_fallback",
+        profile_id="fov_normal_v1",
+        fx_px=5600.0,
+        fy_px=5600.0,
+        cx=2016.0,
+        cy=1512.0,
+        distortion=[0.01, 0.005, 0.0, 0.0, 0.0],
+        distortion_model="opencv_5param",
+    )
+    d = intrinsics.to_dict()
+    assert d["profile_source"] == "fov_class_fallback"
+    assert d["distortion"]["k1"] == 0.01
+    assert d["distortion"]["k2"] == 0.005

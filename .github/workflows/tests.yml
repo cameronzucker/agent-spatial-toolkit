@@ -23,6 +23,12 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
       - name: Install dependencies
         run: uv sync --all-groups
+      - name: Install Playwright browser
+        # Required by tests/test_ui_smoke.py (pytest-playwright); the python
+        # package is installed via uv sync, but the browser binary lives in
+        # ~/.cache/ms-playwright and must be fetched separately. ubuntu-latest
+        # carries Chromium's runtime libraries, so --with-deps is unnecessary.
+        run: uv run playwright install chromium
       - name: Run tests
         # TODO(after Task 0.2 ships real tests): remove this guard and revert to plain `uv run pytest -v`
         run: |

@@ -1,0 +1,25 @@
+{
+  "_comment": "TEMPLATE — copy to state.json (which is gitignored) and edit. The auto_claude framework reads only state.json at runtime; this file is committed for reference.",
+  "schema_version": 1,
+  "tasks": [
+    {
+      "id": "TASK-001",
+      "title": "Example task — replace me",
+      "status": "pending",
+      "branch": "feat/example-task",
+      "head_sha_at_lease_start": null,
+      "pr_number": null,
+      "pr_url": null,
+      "phase": null,
+      "attempts": 0,
+      "max_attempts": 3,
+      "depends_on": [],
+      "created_at": "2026-05-04T00:00:00Z",
+      "updated_at": "2026-05-04T00:00:00Z",
+      "notes": "Free-form instructions for the implementer claude session."
+    }
+  ],
+  "current_lease": null,
+  "backoff_until": null,
+  "last_session_id": null
+}

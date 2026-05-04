@@ -41,4 +41,7 @@ coverage.xml
 
 # uv
 uv.lock
-.handoff/
+
+# Handoff dir: most contents are runtime data, but we track:
+#   .gitkeep, .gitignore, README.md, state.example.json
+# (the inner .handoff/.gitignore selects what to ignore per-machine)

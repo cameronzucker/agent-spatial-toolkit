@@ -27,6 +27,8 @@ export AUTO_CLAUDE_REPO_ROOT
 source "$SCRIPT_DIR/lock_helpers.sh"
 # shellcheck source=state_helpers.sh
 source "$SCRIPT_DIR/state_helpers.sh"
+# shellcheck source=audit.sh
+source "$SCRIPT_DIR/audit.sh"
 
 # Source state_helpers for state_set_task_status used in inspect_gh's
 # pr_open → done auto-update.

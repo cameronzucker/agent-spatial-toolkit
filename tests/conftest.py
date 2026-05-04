@@ -1,4 +1,5 @@
 """Shared pytest fixtures for agent-spatial-toolkit."""
+
 from pathlib import Path
 
 import pytest

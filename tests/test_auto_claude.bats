@@ -1084,6 +1084,85 @@ JSON
     [[ "$output" -ge 1 ]]
 }
 
+@test "watchdog stale-lock cleanup serializes via .lock.serial flock (NB3)" {
+    # NB3: verify-then-rm must be wrapped in the same flock that
+    # update_heartbeat and release_lock use, so a fresh acquire_lock that
+    # races the watchdog cannot have its lock clobbered by the watchdog's
+    # rm.
+    #
+    # Deterministic test of the flock semantics: hold .lock.serial
+    # externally, run watchdog in the background, and verify that watchdog
+    # cannot proceed past the verify-then-rm critical section while we hold
+    # the flock. After we release, watchdog completes — and the lock is
+    # only rm'd if the identity check passed.
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"pending","branch":"feat/t","attempts":0,"depends_on":[]}
+  ],
+  "current_lease": null
+}
+JSON
+    cat > "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/reconcile.sh" <<'SH'
+#!/usr/bin/env bash
+cat <<JSON
+{"lock":{"state":"stale","session_id":"stale","pid":99999,"heartbeat_at":"2020-01-01T00:00:00Z","age_s":7200,"boot_id":"00000000-0000-0000-0000-000000000000","boot_match":true},"git":{"state":"clean","branch":"main","upstream":"","ahead":0},"gh":{"open_prs":[],"fetched":false},"state_file":{"present":true,"valid":true},"current_lease_task":null,"next_pending_task":{"id":"TASK-1","title":"t","status":"pending","branch":"feat/t","attempts":0,"depends_on":[]}}
+JSON
+SH
+    chmod +x "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/reconcile.sh"
+
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/.lock" <<'JSON'
+{
+  "session_id":"stale",
+  "pid":99999,
+  "ppid":1,
+  "host":"test",
+  "boot_id":"00000000-0000-0000-0000-000000000000",
+  "started_at":"2020-01-01T00:00:00Z",
+  "heartbeat_at":"2020-01-01T00:00:00Z",
+  "current_branch":"feat/t",
+  "current_task_id":"TASK-1",
+  "phase":"editing"
+}
+JSON
+
+    # Step 1: hold .serial flock from the test process via a coprocess
+    # helper. We use flock(1) wrapping a sleep so the lock is held until
+    # we kill the helper.
+    local serial="$AUTO_CLAUDE_REPO_ROOT/.handoff/.lock.serial"
+    : > "$serial"
+    flock -x "$serial" -c 'sleep 30' &
+    local holder_pid=$!
+    # Give flock a moment to actually grab the lock.
+    sleep 0.2
+
+    # Step 2: spawn the watchdog. It should block waiting for .serial.
+    AUTO_CLAUDE_DRY_RUN=1 "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/watchdog.sh" >/dev/null 2>&1 &
+    local wd_pid=$!
+
+    # Step 3: while watchdog is blocked, the stale lock must STILL exist
+    # (watchdog hasn't passed the flock yet). Wait briefly to let watchdog
+    # try to enter the critical section.
+    sleep 0.5
+    [[ -f "$AUTO_CLAUDE_REPO_ROOT/.handoff/.lock" ]]
+    local owner_during
+    owner_during=$(jq -r '.session_id' "$AUTO_CLAUDE_REPO_ROOT/.handoff/.lock" 2>/dev/null || echo "")
+    [[ "$owner_during" == "stale" ]]
+
+    # Step 4: release the .serial flock (kill the holder). Now watchdog
+    # acquires it, verifies identity (still "stale"), rm's the file.
+    kill "$holder_pid" 2>/dev/null || true
+    wait "$holder_pid" 2>/dev/null || true
+    wait "$wd_pid"
+
+    # Final state: lock removed because identity matched on the recheck.
+    [[ ! -f "$AUTO_CLAUDE_REPO_ROOT/.handoff/.lock" ]]
+    run grep -c '"type":"lock_cleared_stale"' "$AUTO_CLAUDE_REPO_ROOT/.handoff/events.jsonl"
+    [[ "$output" -ge 1 ]]
+}
+
 @test "watchdog clears lock when boot_id matches snapshot (NB2 positive case)" {
     # Companion to NB2: when boot_id (along with session_id/pid/heartbeat)
     # matches the snapshot, the cleanup proceeds — proving boot_id is being

@@ -6,6 +6,7 @@ import pytest
 
 from agent_spatial_toolkit.pipeline.intrinsics import Intrinsics
 from agent_spatial_toolkit.pipeline.pose import (
+    ANCHOR_RMS_THRESHOLD_NORMALIZED_PX,
     PoseResult,
     PoseSolveError,
     solve_pnp,
@@ -64,7 +65,8 @@ def test_solve_pnp_recovers_known_pose_with_4_anchors() -> None:
     assert isinstance(result, PoseResult)
     assert result.anchor_reprojection_rms_px < 0.5  # should be ~zero, allow noise
     # Recovered tvec should be very close to true_tvec
-    assert np.allclose(result.tvec, true_tvec, atol=1.0)
+    assert np.allclose(result.tvec, true_tvec, atol=1e-6)
+    assert np.allclose(result.rvec, true_rvec, atol=1e-6)
 
 
 def test_solve_pnp_with_3_collinear_points_raises() -> None:
@@ -128,7 +130,85 @@ def test_solve_pnp_high_rms_flags_intrinsics_suspect() -> None:
         image_size=(1000, 1000),
     )
 
+    assert result.anchor_reprojection_rms_px > ANCHOR_RMS_THRESHOLD_NORMALIZED_PX
     assert result.intrinsics_suspect is True
+
+
+def test_solve_pnp_rejects_nan_pixel() -> None:
+    """A NaN in pixel_points raises PoseSolveError, not silent garbage pose."""
+    intr = _make_test_intrinsics()
+    world_pts = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [50.0, 0.0, 0.0],
+            [50.0, 30.0, 0.0],
+            [0.0, 30.0, 0.0],
+        ]
+    )
+    pixels = np.array(
+        [
+            [400.0, 400.0],
+            [600.0, 400.0],
+            [600.0, 600.0],
+            [float("nan"), 600.0],
+        ]
+    )
+    with pytest.raises(PoseSolveError, match="finite"):
+        solve_pnp(
+            world_points=world_pts,
+            pixel_points=pixels,
+            intrinsics=intr,
+            image_size=(1000, 1000),
+        )
+
+
+def test_solve_pnp_rejects_inf_world_point() -> None:
+    """An Inf in world_points raises PoseSolveError."""
+    intr = _make_test_intrinsics()
+    world_pts = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [50.0, 0.0, 0.0],
+            [50.0, 30.0, 0.0],
+            [float("inf"), 30.0, 0.0],
+        ]
+    )
+    pixels = np.array(
+        [
+            [400.0, 400.0],
+            [600.0, 400.0],
+            [600.0, 600.0],
+            [400.0, 600.0],
+        ]
+    )
+    with pytest.raises(PoseSolveError, match="finite"):
+        solve_pnp(
+            world_points=world_pts,
+            pixel_points=pixels,
+            intrinsics=intr,
+            image_size=(1000, 1000),
+        )
+
+
+def test_solve_pnp_rejects_wrong_pixel_shape() -> None:
+    """A 1-D pixel_points array raises PoseSolveError with a shape message."""
+    intr = _make_test_intrinsics()
+    world_pts = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [50.0, 0.0, 0.0],
+            [50.0, 30.0, 0.0],
+            [0.0, 30.0, 0.0],
+        ]
+    )
+    pixels_flat = np.array([400.0, 400.0, 600.0, 400.0, 600.0, 600.0, 400.0, 600.0])
+    with pytest.raises(PoseSolveError, match="shape"):
+        solve_pnp(
+            world_points=world_pts,
+            pixel_points=pixels_flat,
+            intrinsics=intr,
+            image_size=(1000, 1000),
+        )
 
 
 def test_pose_result_serializes_to_dict() -> None:

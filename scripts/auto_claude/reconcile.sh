@@ -88,6 +88,7 @@ inspect_lock() {
             pid:($pid|tonumber),
             heartbeat_at:$heartbeat_at,
             age_s:($age_s|tonumber),
+            boot_id:$boot_id,
             boot_match: ($boot_id == $current_boot)
         }'
 }

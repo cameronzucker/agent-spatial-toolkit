@@ -119,44 +119,74 @@ case "$lock_state" in
             reason="lock stale (age ${lock_age}s, between $LOCK_MAX_AGE and $STALE_HARD_AGE)"
             audit_event "alert_stuck" "$(jq -cn --argjson recon "$recon" '{recon:$recon}')"
         else
-            # B6: verify-then-rm. The reconcile snapshot was taken some ms ago.
-            # A new session might have just acquired the lock; if we rm it
-            # blindly we wipe a live session's lock and the watchdog spawns a
-            # successor that races the live session. Re-read .handoff/.lock
-            # and confirm session_id + boot_id still match the snapshot before
-            # deleting.
+            # B6 + NB2: verify-then-rm under the lock-mutation serial flock.
+            # The reconcile snapshot was taken some ms ago. A new session
+            # might have just acquired the lock; if we rm it blindly we wipe
+            # a live session's lock and the watchdog spawns a successor that
+            # races the live session.
+            #
+            # Identity tuple includes session_id, pid, heartbeat_at AND
+            # boot_id — the previous version omitted boot_id even though the
+            # comment promised it, leaving a gap a same-host attacker could
+            # exploit by crafting a same-pid+session lock with mismatched
+            # boot_id (NB2).
+            #
+            # NB3: the verify-then-rm is wrapped in the same .serial flock
+            # that update_heartbeat and release_lock acquire. Without that,
+            # a new acquire_lock between our verify and our rm could be
+            # clobbered.
             stale_session_id=$(jq -r '.lock.session_id // empty' <<<"$recon")
             stale_pid=$(jq -r '.lock.pid // 0' <<<"$recon")
             stale_heartbeat=$(jq -r '.lock.heartbeat_at // empty' <<<"$recon")
-            current_session_id=""
-            current_pid="0"
-            current_heartbeat=""
-            if [[ -f "$SESSION_LOCK" ]]; then
-                current_session_id=$(jq -r '.session_id // empty' "$SESSION_LOCK" 2>/dev/null || echo "")
-                current_pid=$(jq -r '.pid // 0' "$SESSION_LOCK" 2>/dev/null || echo "0")
-                current_heartbeat=$(jq -r '.heartbeat_at // empty' "$SESSION_LOCK" 2>/dev/null || echo "")
-            fi
-            if [[ -f "$SESSION_LOCK" \
-                  && ( "$current_session_id" != "$stale_session_id" \
-                       || "$current_pid" != "$stale_pid" \
-                       || "$current_heartbeat" != "$stale_heartbeat" ) ]]; then
+            stale_boot_id=$(jq -r '.lock.boot_id // empty' <<<"$recon")
+
+            serial="${SESSION_LOCK}.serial"
+            mkdir -p "$(dirname "$serial")"
+            cleanup_status_file=$(mktemp "$AUTO_CLAUDE_REPO_ROOT/.handoff/.watchdog-cleanup.XXXXXX")
+            (
+                flock -x 200
+                if [[ ! -f "$SESSION_LOCK" ]]; then
+                    # Lock vanished while we waited for the flock; nothing to
+                    # do. Treat as already-cleared.
+                    echo "cleared:::" > "$cleanup_status_file"
+                    exit 0
+                fi
+                cur_session=$(jq -r '.session_id // empty' "$SESSION_LOCK" 2>/dev/null || echo "")
+                cur_pid=$(jq -r '.pid // 0' "$SESSION_LOCK" 2>/dev/null || echo "0")
+                cur_hb=$(jq -r '.heartbeat_at // empty' "$SESSION_LOCK" 2>/dev/null || echo "")
+                cur_boot=$(jq -r '.boot_id // empty' "$SESSION_LOCK" 2>/dev/null || echo "")
+                if [[ "$cur_session" != "$stale_session_id" \
+                      || "$cur_pid" != "$stale_pid" \
+                      || "$cur_hb" != "$stale_heartbeat" \
+                      || "$cur_boot" != "$stale_boot_id" ]]; then
+                    printf 'changed:%s:%s:%s:%s\n' "$cur_session" "$cur_pid" "$cur_hb" "$cur_boot" > "$cleanup_status_file"
+                    exit 0
+                fi
+                rm -f "$SESSION_LOCK"
+                echo "cleared:::" > "$cleanup_status_file"
+            ) 200>"$serial"
+            cleanup_outcome=$(cat "$cleanup_status_file" 2>/dev/null || echo "")
+            rm -f "$cleanup_status_file"
+
+            if [[ "$cleanup_outcome" == cleared:* ]]; then
+                decision="consider_spawn"
+                reason="lock stale beyond hard cutoff (age ${lock_age}s) — clearing"
+                audit_event "lock_cleared_stale" "$(jq -cn --argjson recon "$recon" '{recon:$recon}')"
+            else
                 # The lock changed between the snapshot and now. Abort cleanup.
+                IFS=":" read -r _ cur_session cur_pid cur_hb cur_boot <<<"$cleanup_outcome"
                 decision="alert_lock_changed_during_cleanup"
-                reason="stale-lock cleanup aborted: lock identity changed (snapshot=$stale_session_id/$stale_pid, current=$current_session_id/$current_pid)"
+                reason="stale-lock cleanup aborted: lock identity changed (snapshot=$stale_session_id/$stale_pid, current=$cur_session/$cur_pid)"
                 audit_event "alert_lock_changed_during_cleanup" "$(jq -cn \
                     --arg snap_session "$stale_session_id" \
                     --arg snap_pid "$stale_pid" \
                     --arg snap_hb "$stale_heartbeat" \
-                    --arg cur_session "$current_session_id" \
-                    --arg cur_pid "$current_pid" \
-                    --arg cur_hb "$current_heartbeat" \
-                    '{snapshot:{session_id:$snap_session, pid:($snap_pid|tonumber), heartbeat_at:$snap_hb}, current:{session_id:$cur_session, pid:($cur_pid|tonumber), heartbeat_at:$cur_hb}}')"
-            else
-                decision="consider_spawn"
-                reason="lock stale beyond hard cutoff (age ${lock_age}s) — clearing"
-                # Explicitly clear the dead lock so next iteration sees it as absent.
-                rm -f "$SESSION_LOCK"
-                audit_event "lock_cleared_stale" "$(jq -cn --argjson recon "$recon" '{recon:$recon}')"
+                    --arg snap_boot "$stale_boot_id" \
+                    --arg cur_session "$cur_session" \
+                    --arg cur_pid "$cur_pid" \
+                    --arg cur_hb "$cur_hb" \
+                    --arg cur_boot "$cur_boot" \
+                    '{snapshot:{session_id:$snap_session, pid:($snap_pid|tonumber), heartbeat_at:$snap_hb, boot_id:$snap_boot}, current:{session_id:$cur_session, pid:($cur_pid|tonumber), heartbeat_at:$cur_hb, boot_id:$cur_boot}}')"
             fi
         fi
         ;;

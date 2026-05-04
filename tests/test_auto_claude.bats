@@ -1034,6 +1034,99 @@ JSON
     [[ "$output" == "0" ]]
 }
 
+@test "watchdog refuses to rm a lock whose boot_id changed since reconcile (NB2)" {
+    # NB2: even when session_id, pid, and heartbeat_at all match, a
+    # mismatched boot_id means the snapshot is from before a reboot — or
+    # from a different machine — and the on-disk lock should not be
+    # treated as the same one. The previous code never read or compared
+    # boot_id; this test demonstrates the gap is closed.
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"pending","branch":"feat/t","attempts":0,"depends_on":[]}
+  ],
+  "current_lease": null
+}
+JSON
+    # Fake reconcile reports the snapshot boot_id as zeros; real lock has
+    # a different boot_id but matching session_id+pid+heartbeat. With the
+    # NB2 fix, that mismatch must abort the cleanup.
+    cat > "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/reconcile.sh" <<'SH'
+#!/usr/bin/env bash
+cat <<JSON
+{"lock":{"state":"stale","session_id":"twin","pid":99999,"heartbeat_at":"2020-01-01T00:00:00Z","age_s":7200,"boot_id":"00000000-0000-0000-0000-000000000000","boot_match":true},"git":{"state":"clean","branch":"main","upstream":"","ahead":0},"gh":{"open_prs":[],"fetched":false},"state_file":{"present":true,"valid":true},"current_lease_task":null,"next_pending_task":{"id":"TASK-1","title":"t","status":"pending","branch":"feat/t","attempts":0,"depends_on":[]}}
+JSON
+SH
+    chmod +x "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/reconcile.sh"
+
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/.lock" <<'JSON'
+{
+  "session_id":"twin",
+  "pid":99999,
+  "ppid":1,
+  "host":"test",
+  "boot_id":"11111111-1111-1111-1111-111111111111",
+  "started_at":"2020-01-01T00:00:00Z",
+  "heartbeat_at":"2020-01-01T00:00:00Z",
+  "current_branch":"feat/t",
+  "current_task_id":"TASK-1",
+  "phase":"editing"
+}
+JSON
+
+    AUTO_CLAUDE_DRY_RUN=1 run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/watchdog.sh"
+    [[ "$status" -eq 0 ]]
+    # Lock with mismatched boot_id was NOT deleted.
+    [[ -f "$AUTO_CLAUDE_REPO_ROOT/.handoff/.lock" ]]
+    run grep -c '"type":"alert_lock_changed_during_cleanup"' "$AUTO_CLAUDE_REPO_ROOT/.handoff/events.jsonl"
+    [[ "$output" -ge 1 ]]
+}
+
+@test "watchdog clears lock when boot_id matches snapshot (NB2 positive case)" {
+    # Companion to NB2: when boot_id (along with session_id/pid/heartbeat)
+    # matches the snapshot, the cleanup proceeds — proving boot_id is being
+    # consulted but not over-rejecting on a genuine match.
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"pending","branch":"feat/t","attempts":0,"depends_on":[]}
+  ],
+  "current_lease": null
+}
+JSON
+    cat > "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/reconcile.sh" <<'SH'
+#!/usr/bin/env bash
+cat <<JSON
+{"lock":{"state":"stale","session_id":"twin","pid":99999,"heartbeat_at":"2020-01-01T00:00:00Z","age_s":7200,"boot_id":"22222222-2222-2222-2222-222222222222","boot_match":true},"git":{"state":"clean","branch":"main","upstream":"","ahead":0},"gh":{"open_prs":[],"fetched":false},"state_file":{"present":true,"valid":true},"current_lease_task":null,"next_pending_task":{"id":"TASK-1","title":"t","status":"pending","branch":"feat/t","attempts":0,"depends_on":[]}}
+JSON
+SH
+    chmod +x "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/reconcile.sh"
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/.lock" <<'JSON'
+{
+  "session_id":"twin",
+  "pid":99999,
+  "ppid":1,
+  "host":"test",
+  "boot_id":"22222222-2222-2222-2222-222222222222",
+  "started_at":"2020-01-01T00:00:00Z",
+  "heartbeat_at":"2020-01-01T00:00:00Z",
+  "current_branch":"feat/t",
+  "current_task_id":"TASK-1",
+  "phase":"editing"
+}
+JSON
+    AUTO_CLAUDE_DRY_RUN=1 run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/watchdog.sh"
+    [[ "$status" -eq 0 ]]
+    # Lock removed because all four fields matched.
+    [[ ! -f "$AUTO_CLAUDE_REPO_ROOT/.handoff/.lock" ]]
+    run grep -c '"type":"lock_cleared_stale"' "$AUTO_CLAUDE_REPO_ROOT/.handoff/events.jsonl"
+    [[ "$output" -ge 1 ]]
+}
+
 @test "watchdog refuses to spawn when git is mid-merge" {
     source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
     cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'

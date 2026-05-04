@@ -1,0 +1,79 @@
+{
+  "anchors": [
+    {
+      "id": "anchor_origin",
+      "pcb_xyz_mm": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "id": "anchor_x_max",
+      "pcb_xyz_mm": [
+        200.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "id": "anchor_xy_max",
+      "pcb_xyz_mm": [
+        200.0,
+        150.0,
+        0.0
+      ]
+    },
+    {
+      "id": "anchor_y_max",
+      "pcb_xyz_mm": [
+        0.0,
+        150.0,
+        0.0
+      ]
+    }
+  ],
+  "features": [
+    {
+      "id": "origin_marker",
+      "pcb_xyz_mm": [
+        10.0,
+        10.0,
+        0.0
+      ]
+    },
+    {
+      "id": "center_marker",
+      "pcb_xyz_mm": [
+        100.0,
+        75.0,
+        0.0
+      ]
+    },
+    {
+      "id": "upper_right",
+      "pcb_xyz_mm": [
+        180.0,
+        20.0,
+        0.0
+      ]
+    },
+    {
+      "id": "lower_left",
+      "pcb_xyz_mm": [
+        20.0,
+        130.0,
+        0.0
+      ]
+    },
+    {
+      "id": "right_edge",
+      "pcb_xyz_mm": [
+        185.0,
+        75.0,
+        0.0
+      ]
+    }
+  ],
+  "render_resolution_px_per_mm": 4.0
+}

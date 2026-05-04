@@ -3,7 +3,10 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from agent_spatial_toolkit.server.session import (
+    SessionLoadError,
     create_session,
     load_session,
     session_dir_name,
@@ -47,3 +50,43 @@ def test_session_default_base_dir_is_user_home(monkeypatch, tmp_path: Path) -> N
     from agent_spatial_toolkit.server.session import default_base_dir
 
     assert default_base_dir() == tmp_path / ".spatial-annotations"
+
+
+def test_create_session_rejects_path_traversal(tmp_path: Path) -> None:
+    """A part_id like '../escape' is rejected (path traversal vulnerability)."""
+    base = tmp_path / "sessions"
+    with pytest.raises(ValueError, match="part_id"):
+        create_session(part_id="../escape", base_dir=base)
+
+
+def test_create_session_rejects_slashes(tmp_path: Path) -> None:
+    """A part_id containing '/' is rejected (would create nested dirs)."""
+    base = tmp_path / "sessions"
+    with pytest.raises(ValueError, match="part_id"):
+        create_session(part_id="a/b", base_dir=base)
+
+
+def test_create_session_rejects_dot_aliases(tmp_path: Path) -> None:
+    """part_id of '.' or '..' is rejected even though regex would otherwise allow them."""
+    base = tmp_path / "sessions"
+    with pytest.raises(ValueError, match="part_id"):
+        create_session(part_id=".", base_dir=base)
+    with pytest.raises(ValueError, match="part_id"):
+        create_session(part_id="..", base_dir=base)
+
+
+def test_load_session_raises_on_missing_state(tmp_path: Path) -> None:
+    """A directory without state.json yields SessionLoadError with path context."""
+    bogus_dir = tmp_path / "no_state_here"
+    bogus_dir.mkdir()
+    with pytest.raises(SessionLoadError, match="state.json not found"):
+        load_session(bogus_dir)
+
+
+def test_load_session_raises_on_malformed_state(tmp_path: Path) -> None:
+    """A corrupt state.json yields SessionLoadError mentioning malformed."""
+    bogus_dir = tmp_path / "corrupt"
+    bogus_dir.mkdir()
+    (bogus_dir / "state.json").write_text("{ not valid json")
+    with pytest.raises(SessionLoadError, match="malformed"):
+        load_session(bogus_dir)

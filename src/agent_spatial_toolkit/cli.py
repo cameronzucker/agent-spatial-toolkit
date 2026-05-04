@@ -29,6 +29,7 @@ import hashlib
 import json
 import shutil
 import sys
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -48,12 +49,25 @@ ALLOWED_PHOTO_EXTS = frozenset({".jpg", ".jpeg", ".png"})
 
 
 def _validate_photo_path(path_str: str) -> Path:
-    """argparse type-converter: path must exist and be JPEG/PNG (spec §8 line 626)."""
+    """argparse type-converter: path must exist + be a decodable JPEG/PNG (spec §8 line 626)."""
     p = Path(path_str).expanduser().resolve()
     if not p.is_file():
         raise argparse.ArgumentTypeError(f"photo not found: {path_str}")
     if p.suffix.lower() not in ALLOWED_PHOTO_EXTS:
         raise argparse.ArgumentTypeError(f"photo must be JPEG or PNG; got {p.suffix!r}: {path_str}")
+    # Content validation: open + verify(). Pillow's verify() does a fast
+    # structural check without decoding pixel data. A .jpg-named text file
+    # would pass the suffix check above and later break the wizard; this
+    # rejects spoofed/corrupt files at argparse time.
+    try:
+        from PIL import Image
+
+        with Image.open(p) as img:
+            img.verify()
+    except Exception as e:
+        raise argparse.ArgumentTypeError(
+            f"photo is not a valid JPEG/PNG (decode failed): {path_str}: {e}"
+        ) from e
     return p
 
 
@@ -151,41 +165,81 @@ def _write_manifest(manifest: dict[str, dict[str, object]], session_dir: Path) -
 
 
 class _ProxyServer:
-    """Forwards ``shutdown()`` to a real Server once one is bound.
+    """Forwards ``shutdown()`` to the real Server once ``bind()`` is called.
 
     The Flask app needs a server reference (for ``/api/finalize`` shutdown), but
     ``start_server`` needs the Flask app first — a chicken-and-egg dependency.
     The proxy is created up front, the app is built around it, the real server
-    starts, and we then point the proxy at the real server. A direct
-    ``shutdown()`` call before binding is a silent no-op (cannot happen in the
-    current flow but defensive against future edits).
+    starts, and we then point the proxy at the real server.
+
+    If ``shutdown()`` is called BEFORE ``bind()`` — the race window between
+    ``start_server`` returning and ``proxy.bind(server)`` running, during which
+    a fast loopback ``POST /api/finalize`` could fire ``_trigger_async_shutdown``
+    — the call is recorded as pending and flushed when ``bind()`` runs. The
+    lock-protected check-and-set ensures that if ``bind()`` and ``shutdown()``
+    race, exactly one of two things happens: either ``bind()`` sees
+    ``_pending_shutdown=True`` and triggers the shutdown itself, OR
+    ``shutdown()`` sees ``_real != None`` and calls through directly.
     """
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self._real: object | None = None
+        self._pending_shutdown = False
 
     def bind(self, real: object) -> None:
-        self._real = real
+        with self._lock:
+            self._real = real
+            should_shutdown = self._pending_shutdown
+        if should_shutdown:
+            real.shutdown()  # type: ignore[attr-defined]
 
     def shutdown(self) -> None:
-        if self._real is not None:
-            self._real.shutdown()  # type: ignore[attr-defined]
+        with self._lock:
+            real = self._real
+            if real is None:
+                self._pending_shutdown = True
+                return
+        real.shutdown()  # type: ignore[attr-defined]
 
 
 def _annotate(args: argparse.Namespace) -> int:
     """Implement the ``annotate`` subcommand. Returns the exit code."""
-    _validate_part_id(args.part_id)
+    # Surface part_id validation errors as a clean exit-2 message rather than
+    # a Python traceback (matches argparse's convention for usage errors).
+    try:
+        _validate_part_id(args.part_id)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    # Spec §8 line 620: explicit warning when binding to a non-loopback host.
+    if args.host not in ("127.0.0.1", "localhost"):
+        print(
+            f"WARNING: binding to {args.host} exposes the wizard server to other "
+            "machines on this network. Ensure the network is trusted; the wizard "
+            "has no authentication.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     base_dir = args.out.expanduser().resolve() if args.out else default_base_dir()
     session = create_session(part_id=args.part_id, base_dir=base_dir)
+    try:
+        manifest = _copy_photos_and_build_manifest(args.photos, session.session_dir / "photos")
+        _write_manifest(manifest, session.session_dir)
 
-    manifest = _copy_photos_and_build_manifest(args.photos, session.session_dir / "photos")
-    _write_manifest(manifest, session.session_dir)
-
-    proxy = _ProxyServer()
-    app = create_app(server=proxy, session=session)
-    server = start_server(wsgi_app=app, session=session, host=args.host, port=args.port)
-    proxy.bind(server)
+        proxy = _ProxyServer()
+        app = create_app(server=proxy, session=session)
+        server = start_server(wsgi_app=app, session=session, host=args.host, port=args.port)
+        proxy.bind(server)
+    except BaseException:
+        # Setup failed after the session dir was created; clean up the
+        # half-built directory so a re-run starts fresh. BaseException
+        # (vs Exception) ensures cleanup runs on KeyboardInterrupt /
+        # SystemExit too. Re-raise so the operator sees the underlying error.
+        shutil.rmtree(session.session_dir, ignore_errors=True)
+        raise
 
     print(f"Open {server.url} to annotate part {args.part_id}.", flush=True)
 

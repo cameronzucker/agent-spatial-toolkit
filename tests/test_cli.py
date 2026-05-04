@@ -53,24 +53,74 @@ def test_cli_rejects_nonexistent_photo_path(tmp_path: Path) -> None:
     assert exc.value.code != 0
 
 
-def test_cli_rejects_invalid_part_id(tmp_path: Path) -> None:
-    """An invalid part_id (path-traversal style) raises ValueError before the server starts."""
+def test_cli_rejects_invalid_part_id(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Invalid part_id exits 2 with a clean stderr message; no traceback."""
     from agent_spatial_toolkit.cli import main
 
     photo = tmp_path / "p.jpg"
     _make_test_jpeg(photo)
-    with pytest.raises(ValueError):
-        main(
-            argv=[
-                "annotate",
-                "--part-id",
-                "../escape",
-                "--photos",
-                str(photo),
-                "--out",
-                str(tmp_path / "sessions"),
-            ]
-        )
+    code = main(
+        argv=[
+            "annotate",
+            "--part-id",
+            "../escape",
+            "--photos",
+            str(photo),
+            "--out",
+            str(tmp_path / "sessions"),
+        ]
+    )
+    assert code == 2
+    captured = capsys.readouterr()
+    assert "part_id" in captured.err
+
+
+def test_cli_rejects_corrupt_jpeg(tmp_path: Path) -> None:
+    """A .jpg file that isn't actually JPEG is rejected at argparse time."""
+    from agent_spatial_toolkit.cli import main
+
+    fake = tmp_path / "fake.jpg"
+    fake.write_bytes(b"this is not a JPEG, just bytes")
+    with pytest.raises(SystemExit) as exc:
+        main(argv=["annotate", "--part-id", "test", "--photos", str(fake)])
+    assert exc.value.code == 2
+
+
+def test_cli_warns_on_non_loopback_host(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Spec §8 line 620: --host 0.0.0.0 (or other non-loopback) emits an explicit warning."""
+    import agent_spatial_toolkit.cli as cli_module
+
+    photo = tmp_path / "p.jpg"
+    _make_test_jpeg(photo)
+
+    # Avoid actually binding to 0.0.0.0 in CI by failing start_server. The
+    # warning fires BEFORE start_server, so it is still captured.
+    def _fake_start_server(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("test-deliberate-fail")
+
+    orig = cli_module.start_server
+    cli_module.start_server = _fake_start_server  # type: ignore[assignment]
+    try:
+        with pytest.raises(RuntimeError, match="test-deliberate-fail"):
+            cli_module.main(
+                argv=[
+                    "annotate",
+                    "--part-id",
+                    "test",
+                    "--photos",
+                    str(photo),
+                    "--out",
+                    str(tmp_path / "sessions"),
+                    "--host",
+                    "0.0.0.0",
+                ]
+            )
+    finally:
+        cli_module.start_server = orig  # type: ignore[assignment]
+
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err
+    assert "0.0.0.0" in captured.err
 
 
 def test_cli_copies_photos_and_writes_manifest(tmp_path: Path) -> None:

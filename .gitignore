@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+# Build / dist
+build/
+dist/
+*.egg
+
+# IDEs / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Tooling artifacts
+.claude/
+.superpowers/
+
+# Runtime annotation sessions (these belong to the user, not the repo)
+.spatial-annotations/
+
+# uv
+uv.lock

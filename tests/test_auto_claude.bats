@@ -814,6 +814,38 @@ JSON
 
 # ---- session_boot end-to-end with mock claude --------------------------
 
+@test "session_exit refuses pr_open without tests-passed marker file (M2)" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"pending","branch":"feat/t","attempts":0,"depends_on":[]}
+  ],
+  "current_lease": null
+}
+JSON
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    state_acquire_lease "TASK-1" "sess-A" "feat/t" "$(git rev-parse HEAD)"
+    git checkout -q -b feat/t
+    # Make a commit whose message contains "test" (formerly enough to satisfy
+    # the heuristic). Without the marker file, session_exit MUST NOT classify
+    # this as pr_open.
+    echo "x" > work
+    git add work
+    git commit -q -m "fix: latest tweak (mentions test in passing)"
+
+    # No marker file — session_exit must reclassify as pending (attempts<max).
+    AUTO_CLAUDE_SESSION_ID="sess-A" run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/session_exit.sh" \
+        TASK-1 sess-A 0
+    [[ "$status" -eq 0 ]]
+    final=$(jq -r '.tasks[0].status' "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json")
+    [[ "$final" == "pending" ]]
+    # And the gate failure was recorded.
+    run grep -c '"no_tests_passed_marker"' "$AUTO_CLAUDE_REPO_ROOT/.handoff/events.jsonl"
+    [[ "$output" -ge 1 ]]
+}
+
 @test "session_boot creates branch, leases, exits cleanly with mock claude" {
     source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
     cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'

@@ -176,11 +176,17 @@ BINDING RULES (violations will be rejected by the safe-git wrapper and the pre-c
 3. You MUST NOT cd outside the repo root '$AUTO_CLAUDE_REPO_ROOT'.
 4. Update task phase as you progress: scripts/auto_claude/state_helpers.sh provides state_set_task_phase.
    Phases: editing -> tests_running -> committing -> pushing -> pr_opening -> pr_open
-5. Before exit: ensure tests pass, commit, push, open a PR via 'gh pr create'.
-6. If something goes wrong you cannot fix, leave a clear note in .handoff/ and exit nonzero.
+5. After tests pass and BEFORE opening the PR you MUST run:
+       touch .handoff/tests-passed-$task_id
+   This is a hard quality gate. session_exit refuses to classify the session as
+   pr_open without this marker file. Do not create the marker speculatively —
+   only after the test command (pytest/bats/etc.) actually exits 0.
+6. Before exit: ensure tests pass, commit, push, touch the marker, then open a PR via 'gh pr create'.
+7. If something goes wrong you cannot fix, leave a clear note in .handoff/ and exit nonzero.
 
 Success criteria for this task:
 - Tests pass.
+- .handoff/tests-passed-$task_id exists.
 - Branch is pushed to origin.
 - A PR is open against main.
 - The session terminates cleanly (exit 0) after PR creation.

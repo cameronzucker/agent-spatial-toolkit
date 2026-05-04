@@ -111,19 +111,25 @@ if command -v gh >/dev/null 2>&1; then
     fi
 fi
 
-# Tests-passed marker: last commit message mentions "test" or .handoff/tests-passed exists
+# Tests-passed marker: a per-task file the implementer must touch as part
+# of its workflow AFTER tests pass. The previous heuristic
+# (`grep -qiE 'test' "$last_commit_msg"`) matched anything containing the
+# substring "test" — "fix typo in latest", "contest UI", etc. — and was
+# trivially gameable. The marker is a real signal: the implementer's
+# prompt instructs it to `touch .handoff/tests-passed-<task_id>` only after
+# `pytest`/`bats`/etc. exits 0, immediately before opening the PR.
+#
+# Hard gate: no marker => no pr_open classification, regardless of other
+# signals. The session is reclassified pending (will retry) or blocked
+# (attempts exhausted).
+tests_marker="$AUTO_CLAUDE_REPO_ROOT/.handoff/tests-passed-$task_id"
 tests_evidence=0
-last_msg=$(git log -1 --pretty=%B 2>/dev/null || echo "")
-if [[ -f "$AUTO_CLAUDE_REPO_ROOT/.handoff/tests-passed" ]]; then
-    tests_evidence=1
-elif grep -qiE 'test' <<<"$last_msg"; then
+if [[ -f "$tests_marker" ]]; then
     tests_evidence=1
 fi
 if (( tests_evidence == 0 )); then
-    gate_failures+=("no_tests_evidence")
-    # Tests evidence is a soft gate for v1 — log it but don't block PR_OPEN
-    # if all hard gates pass. Comment this in/out per policy.
-    # gate_ok=0
+    gate_ok=0
+    gate_failures+=("no_tests_passed_marker")
 fi
 
 # Determine final_status
@@ -159,6 +165,10 @@ audit_event "quality_gates" "$(jq -cn \
 state_release_lease "$task_id" "$session_id" "$final_status" || {
     audit_event "session_exit_warning" '{"reason":"state_release_lease_failed"}'
 }
+
+# Consume the tests-passed marker so a future retry of the same task must
+# re-establish that tests pass on its own work.
+rm -f "$tests_marker"
 
 # Reflog snapshot at exit
 exit_snap="$REFLOG_DIR/exit-$(date -u +%Y%m%dT%H%M%SZ)-$session_id.reflog"

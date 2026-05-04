@@ -215,6 +215,16 @@ state_release_lease "$task_id" "$session_id" "$final_status" || {
 # re-establish that tests pass on its own work.
 rm -f "$tests_marker"
 
+# Restore working tree to main so the next watchdog tick doesn't fire
+# alert_dirty_at_boot. Only switch if the tree is clean (uncommitted work
+# signals a broken session that needs human attention — leave it for
+# inspection rather than auto-discarding).
+if [[ -z "$(cd "$AUTO_CLAUDE_REPO_ROOT" && git status --porcelain=v2 2>/dev/null | grep -E '^[12u]' || true)" ]]; then
+    if ! (cd "$AUTO_CLAUDE_REPO_ROOT" && git checkout main >/dev/null 2>&1); then
+        audit_event "session_exit_warning" '{"reason":"checkout_main_failed"}'
+    fi
+fi
+
 # Reflog snapshot at exit
 exit_snap="$REFLOG_DIR/exit-$(date -u +%Y%m%dT%H%M%SZ)-$session_id.reflog"
 git reflog --all --no-abbrev --date=iso > "$exit_snap" 2>/dev/null || true

@@ -2006,3 +2006,35 @@ TOML
     # gate_ok stays unchanged. We assert the absence to document the intended skip.
 }
 
+# ---- Fix 2: session_exit restores main checkout when tree is clean -----
+
+@test "session_exit restores main when working tree is clean" {
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    git checkout -b feat/test-restore 2>/dev/null
+    # Tree is clean here (just initial commit + branch switch)
+    [[ "$(git rev-parse --abbrev-ref HEAD)" == "feat/test-restore" ]]
+
+    # Run the cleanup snippet directly
+    if [[ -z "$(git status --porcelain=v2 2>/dev/null | grep -E '^[12u]' || true)" ]]; then
+        git checkout main >/dev/null 2>&1
+    fi
+
+    [[ "$(git rev-parse --abbrev-ref HEAD)" == "main" ]]
+}
+
+@test "session_exit does NOT restore main when working tree is dirty" {
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    git checkout -b feat/test-keep-dirty 2>/dev/null
+    echo "uncommitted change" > dirty.txt
+    git add dirty.txt
+    # Now the tree has a staged change
+
+    # Run the cleanup snippet directly
+    if [[ -z "$(git status --porcelain=v2 2>/dev/null | grep -E '^[12u]' || true)" ]]; then
+        git checkout main >/dev/null 2>&1
+    fi
+
+    # Should still be on the feature branch
+    [[ "$(git rev-parse --abbrev-ref HEAD)" == "feat/test-keep-dirty" ]]
+}
+

@@ -281,3 +281,120 @@ def test_render_overlay_rejects_zero_focal() -> None:
             pose=_test_pose(),
             intrinsics=intr_bad,
         )
+
+
+# ---------------------------------------------------------------------------
+# render_wireframe tests
+# ---------------------------------------------------------------------------
+
+from agent_spatial_toolkit.pipeline.reproject import render_wireframe  # noqa: E402
+
+
+def _pcb_corner_anchors() -> list[dict]:
+    """Standard PCB preset's 4 corner anchors at 100mm × 80mm."""
+    return [
+        {"id": "pcb_corner_origin", "xyz": [0.0, 0.0, 0.0]},
+        {"id": "pcb_corner_x_max", "xyz": [100.0, 0.0, 0.0]},
+        {"id": "pcb_corner_xy_max", "xyz": [100.0, 80.0, 0.0]},
+        {"id": "pcb_corner_y_max", "xyz": [0.0, 80.0, 0.0]},
+    ]
+
+
+def test_render_wireframe_writes_png(tmp_path: Path) -> None:
+    photo_path = _make_test_photo(tmp_path)
+    out_path = tmp_path / "wireframe.png"
+    result = render_wireframe(
+        photo_path=photo_path,
+        out_path=out_path,
+        frame_anchors=_pcb_corner_anchors(),
+        pose=_test_pose(),
+        intrinsics=_test_intrinsics(),
+    )
+    assert result == out_path
+    assert out_path.exists()
+    img = Image.open(out_path)
+    assert img.size == (1000, 1000)
+
+
+def test_render_wireframe_marks_origin_at_image_center(tmp_path: Path) -> None:
+    """Standard test pose projects world origin to (500, 500) — that pixel
+    must be non-background (the origin axis arrow root sits there)."""
+    photo_path = _make_test_photo(tmp_path)
+    out_path = tmp_path / "wireframe.png"
+    render_wireframe(
+        photo_path=photo_path,
+        out_path=out_path,
+        frame_anchors=_pcb_corner_anchors(),
+        pose=_test_pose(),
+        intrinsics=_test_intrinsics(),
+    )
+    img = np.array(Image.open(out_path))
+    center = img[500, 500]
+    # Background was (100, 100, 100) gray; the origin marker overlay must change it.
+    assert not np.array_equal(center[:3], [100, 100, 100])
+
+
+def test_render_wireframe_handles_three_collinear_anchors(tmp_path: Path) -> None:
+    """3 collinear anchors don't form a closed polygon, but the function still
+    projects + draws lines without error (degenerate-but-valid input)."""
+    photo_path = _make_test_photo(tmp_path)
+    out_path = tmp_path / "wireframe.png"
+    anchors = [
+        {"id": "a", "xyz": [0.0, 0.0, 0.0]},
+        {"id": "b", "xyz": [10.0, 0.0, 0.0]},
+        {"id": "c", "xyz": [20.0, 0.0, 0.0]},
+    ]
+    result = render_wireframe(
+        photo_path=photo_path,
+        out_path=out_path,
+        frame_anchors=anchors,
+        pose=_test_pose(),
+        intrinsics=_test_intrinsics(),
+    )
+    assert result == out_path
+
+
+def test_render_wireframe_rejects_non_finite_pose() -> None:
+    bad = PoseResult(
+        rvec=np.array([np.nan, 0.0, 0.0]),
+        tvec=np.array([0.0, 0.0, 200.0]),
+        anchor_reprojection_rms_px=0.0,
+        intrinsics_suspect=False,
+        pose_solver="t",
+    )
+    with pytest.raises(ValueError, match="pose"):
+        render_wireframe(
+            photo_path=Path("/does/not/matter"),
+            out_path=Path("/tmp/out.png"),
+            frame_anchors=_pcb_corner_anchors(),
+            pose=bad,
+            intrinsics=_test_intrinsics(),
+        )
+
+
+def test_render_wireframe_rejects_non_finite_anchor() -> None:
+    anchors = [
+        {"id": "a", "xyz": [0.0, 0.0, 0.0]},
+        {"id": "bad", "xyz": [np.nan, 0.0, 0.0]},
+        {"id": "c", "xyz": [10.0, 10.0, 0.0]},
+    ]
+    with pytest.raises(ValueError, match="anchor"):
+        render_wireframe(
+            photo_path=Path("/does/not/matter"),
+            out_path=Path("/tmp/out.png"),
+            frame_anchors=anchors,
+            pose=_test_pose(),
+            intrinsics=_test_intrinsics(),
+        )
+
+
+def test_render_wireframe_rejects_empty_anchors(tmp_path: Path) -> None:
+    """Wireframe needs at least 1 anchor to derive scale + draw."""
+    with pytest.raises(ValueError, match="anchor"):
+        render_wireframe(
+            photo_path=_make_test_photo(tmp_path),
+            out_path=tmp_path / "out.png",
+            frame_anchors=[],
+            pose=_test_pose(),
+            intrinsics=_test_intrinsics(),
+        )

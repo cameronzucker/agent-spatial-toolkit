@@ -1,0 +1,13 @@
+# Runtime data — never committed, diverges per machine.
+.lock
+.watchdog.lock
+.backoff.json
+events.jsonl
+logs/
+reflog-snapshots/
+state.json
+STATUS.md
+HANDOFF.md
+
+# Pre-existing legacy session handoff notes (kept local, not tracked).
+HANDOFF-*.md

@@ -1,0 +1,19 @@
+[Unit]
+Description=auto-claude watchdog timer (fires the watchdog every ~20 min)
+Documentation=file://@PROJECT_ROOT@/docs/auto-claude-design.md
+
+[Timer]
+Unit=claude-watchdog.service
+# Wait 2 min after boot so user sessions, network, gh auth refresh have settled.
+OnBootSec=2min
+# Fire 20 min after the previous activation (one-shot service ends quickly,
+# so this is effectively a 20-min cadence with jitter).
+OnUnitActiveSec=20min
+# Allow systemd to batch wake-ups — saves power on the Pi, and a 30s skew
+# is irrelevant for a 20-min cadence.
+AccuracySec=30s
+# After sleep / reboot, fire a catch-up immediately if a tick was missed.
+Persistent=true
+
+[Install]
+WantedBy=default.target

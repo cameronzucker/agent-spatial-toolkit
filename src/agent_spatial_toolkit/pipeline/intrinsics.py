@@ -27,6 +27,24 @@ class CameraDetected:
     detection_source: Literal["exif", "user_specified", "fallback_generic"] = "exif"
 
 
+def _clean_str(value: object) -> str | None:
+    """Coerce an EXIF string value to a stripped non-empty str, or None."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s or None
+
+
+def _coerce_float(value: object) -> float | None:
+    """Coerce an EXIF numeric value to float, or None on malformed input."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def extract_exif_camera_info(image_path: Path | str) -> CameraDetected | None:
     """Read EXIF camera identification from an image file.
 
@@ -38,25 +56,25 @@ def extract_exif_camera_info(image_path: Path | str) -> CameraDetected | None:
     try:
         with Image.open(image_path) as img:
             exif = img.getexif()
-    except (OSError, ValueError, Image.UnidentifiedImageError):
+    except (OSError, ValueError, Image.DecompressionBombError, Image.UnidentifiedImageError):
         return None
 
     if not exif:
         return None
 
-    make = exif.get(_TAG_NAME_TO_ID.get("Make"))
-    model = exif.get(_TAG_NAME_TO_ID.get("Model"))
-    focal_35 = exif.get(_TAG_NAME_TO_ID.get("FocalLengthIn35mmFilm"))
-    lens = exif.get(_TAG_NAME_TO_ID.get("LensModel"))
+    make = _clean_str(exif.get(_TAG_NAME_TO_ID.get("Make")))
+    model = _clean_str(exif.get(_TAG_NAME_TO_ID.get("Model")))
+    focal_35 = _coerce_float(exif.get(_TAG_NAME_TO_ID.get("FocalLengthIn35mmFilm")))
+    lens = _clean_str(exif.get(_TAG_NAME_TO_ID.get("LensModel")))
 
     # If nothing identifying is present, return None
-    if all(v is None for v in (make, model, focal_35, lens)):
+    if make is None and model is None and focal_35 is None and lens is None:
         return None
 
     return CameraDetected(
-        make=str(make).strip() if make else None,
-        model=str(model).strip() if model else None,
-        focal_length_35mm_equiv=float(focal_35) if focal_35 is not None else None,
-        lens_label=str(lens).strip() if lens else None,
+        make=make,
+        model=model,
+        focal_length_35mm_equiv=focal_35,
+        lens_label=lens,
         detection_source="exif",
     )

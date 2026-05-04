@@ -49,8 +49,7 @@ def test_extract_exif_returns_none_when_no_exif(tmp_path: Path) -> None:
 
     info = extract_exif_camera_info(out)
 
-    # Bare JPEG either has empty EXIF or no make/model — both should yield None
-    assert info is None or info.make is None
+    assert info is None
 
 
 def test_extract_exif_handles_partial_metadata(tmp_path: Path) -> None:
@@ -66,6 +65,42 @@ def test_extract_exif_handles_partial_metadata(tmp_path: Path) -> None:
     assert info is not None
     assert info.make == "Apple"
     assert info.model is None
+
+
+def test_extract_exif_treats_whitespace_only_strings_as_missing(tmp_path: Path) -> None:
+    """Whitespace-only EXIF string tags are equivalent to missing tags."""
+    img_path = _make_jpeg_with_exif(
+        tmp_path,
+        {
+            271: "   ",  # Make: whitespace only
+            272: "\t\n",  # Model: whitespace only
+        },
+    )
+    info = extract_exif_camera_info(img_path)
+    assert info is None
+
+
+def test_extract_exif_returns_none_when_only_non_camera_tags(tmp_path: Path) -> None:
+    """EXIF with only non-camera tags (e.g., DateTime) yields None."""
+    # 306 is DateTime — present but does not identify the camera
+    img_path = _make_jpeg_with_exif(tmp_path, {306: "2026:05:03 22:30:00"})
+    info = extract_exif_camera_info(img_path)
+    assert info is None
+
+
+def test_extract_exif_drops_malformed_focal_length(tmp_path: Path) -> None:
+    """A non-numeric FocalLengthIn35mmFilm yields None for the field, not an exception."""
+    img_path = _make_jpeg_with_exif(
+        tmp_path,
+        {
+            271: "Apple",
+            41989: "not a number",  # malformed focal length
+        },
+    )
+    info = extract_exif_camera_info(img_path)
+    assert info is not None
+    assert info.make == "Apple"
+    assert info.focal_length_35mm_equiv is None
 
 
 def test_extract_exif_unknown_format_returns_none(tmp_path: Path) -> None:

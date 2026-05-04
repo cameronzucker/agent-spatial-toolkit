@@ -176,7 +176,10 @@ def test_render_overlay_marker_scales_with_image_size(tmp_path: Path) -> None:
     small_intr = Intrinsics(
         profile_source="fov_class_fallback",
         profile_id="test",
-        fx_px=1000.0, fy_px=1000.0, cx=500.0, cy=500.0,
+        fx_px=1000.0,
+        fy_px=1000.0,
+        cx=500.0,
+        cy=500.0,
         distortion=[0.0, 0.0, 0.0, 0.0, 0.0],
     )
     small_out = tmp_path / "small_overlay.png"
@@ -194,7 +197,10 @@ def test_render_overlay_marker_scales_with_image_size(tmp_path: Path) -> None:
     large_intr = Intrinsics(
         profile_source="fov_class_fallback",
         profile_id="test",
-        fx_px=4000.0, fy_px=4000.0, cx=2000.0, cy=1500.0,
+        fx_px=4000.0,
+        fy_px=4000.0,
+        cx=2000.0,
+        cy=1500.0,
         distortion=[0.0, 0.0, 0.0, 0.0, 0.0],
     )
     large_out = tmp_path / "large_overlay.png"

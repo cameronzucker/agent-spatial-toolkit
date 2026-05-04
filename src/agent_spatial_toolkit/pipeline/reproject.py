@@ -84,7 +84,14 @@ def render_overlay(
     for (label, _), (px, py) in zip(features, projected, strict=True):
         if not (0 <= px < img.shape[1] and 0 <= py < img.shape[0]):
             continue  # off-frame
-        cv2.circle(img, (int(px), int(py)), marker_radius_px, marker_color, marker_thickness, lineType=cv2.LINE_AA)
+        cv2.circle(
+            img,
+            (int(px), int(py)),
+            marker_radius_px,
+            marker_color,
+            marker_thickness,
+            lineType=cv2.LINE_AA,
+        )
         cv2.circle(img, (int(px), int(py)), max(1, marker_thickness), marker_color, -1)
         # Label slightly above and right of the marker
         cv2.putText(

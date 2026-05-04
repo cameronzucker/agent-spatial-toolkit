@@ -86,11 +86,24 @@ trap '_session_cleanup' EXIT
 _heartbeat_pid=""
 # shellcheck disable=SC2317  # invoked via `trap`
 _session_cleanup() {
+    _kill_heartbeat
+    release_lock "$SESSION_LOCK" 2>/dev/null || true
+}
+
+_kill_heartbeat() {
     if [[ -n "${_heartbeat_pid:-}" ]] && kill -0 "$_heartbeat_pid" 2>/dev/null; then
-        kill "$_heartbeat_pid" 2>/dev/null || true
+        # Send TERM to the heartbeat subshell. Then look for any sleep child
+        # it spawned and kill that too — killing the parent shell does not
+        # automatically reap a `sleep` it forked.
+        local kids
+        kids=$(pgrep -P "$_heartbeat_pid" 2>/dev/null || true)
+        kill -TERM "$_heartbeat_pid" 2>/dev/null || true
+        for k in $kids; do
+            kill -TERM "$k" 2>/dev/null || true
+        done
         wait "$_heartbeat_pid" 2>/dev/null || true
     fi
-    release_lock "$SESSION_LOCK" 2>/dev/null || true
+    _heartbeat_pid=""
 }
 
 # Fetch origin (read-only).
@@ -133,9 +146,13 @@ cp -f "$SCRIPT_DIR/hooks/pre-commit" "$hook_dest"
 chmod +x "$hook_dest"
 audit_event "hook_installed" "$(jq -cn --arg p "$hook_dest" '{path:$p}')"
 
-# Heartbeat in background
+# Heartbeat in background. Use exec to replace the subshell with a
+# trapped runner so that killing _heartbeat_pid kills the sleep too.
 (
-    while sleep 300; do
+    trap 'exit 0' TERM INT
+    while true; do
+        sleep 300 &
+        wait $!
         update_heartbeat "$SESSION_LOCK" 2>/dev/null || exit 0
     done
 ) &
@@ -197,13 +214,9 @@ fi
 audit_event "claude_returned" "$(jq -cn --arg s "$session_id" --arg rc "$claude_exit" '{session_id:$s, exit_code:($rc|tonumber)}')"
 
 # Hand off to session_exit for finalization. session_exit takes care of
-# heartbeat kill + lock release on its own; clear our trap so cleanup
-# doesn't double-fire.
+# lock release on its own; clear our trap so cleanup doesn't double-fire.
 trap - EXIT
-if [[ -n "${_heartbeat_pid:-}" ]] && kill -0 "$_heartbeat_pid" 2>/dev/null; then
-    kill "$_heartbeat_pid" 2>/dev/null || true
-    wait "$_heartbeat_pid" 2>/dev/null || true
-fi
+_kill_heartbeat
 
 "$SCRIPT_DIR/session_exit.sh" "$task_id" "$session_id" "$claude_exit"
 exit 0

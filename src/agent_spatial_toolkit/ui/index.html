@@ -53,6 +53,16 @@
                 <span>Notes (optional, for the agent):</span>
                 <textarea class="frame-notes" id="phase-2b-notes" rows="2"></textarea>
             </label>
+            <!-- Revealed only when the user picks "Custom" — provides the
+                 free-text frame definition the spec calls for (line 163,
+                 "or fill in free-text alternatives") plus the structured
+                 origin/axes inputs the plan calls for (line 2919, "custom
+                 origin/axes inputs"). Format documented in the placeholder. -->
+            <label class="input-row" id="phase-2b-custom-anchors-row" hidden>
+                <span>Custom anchor definitions (one per line: <code>id: x, y, z</code> in mm):</span>
+                <textarea class="custom-anchors" id="phase-2b-custom-anchors" rows="6"
+                    placeholder="pcb_corner_origin: 0, 0, 0&#10;pcb_corner_x_max: 86.5, 0, 0&#10;pcb_corner_y_max: 0, 84.5, 0&#10;# lines starting with # are comments"></textarea>
+            </label>
             <button id="phase-2b-next" type="button">Next: click anchors per photo →</button>
             <p id="phase-2b-error" class="error" hidden></p>
         </section>

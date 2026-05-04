@@ -167,6 +167,42 @@ def test_phase_2b_form_computes_anchors_and_advances(
             "pcb_corner_y_max": [0, 84.5, 0],
             "pcb_corner_xy_max": [86.5, 84.5, 0],
         }, f"anchor positions don't match spec example: {anchors_by_id!r}"
+
+        # ─── Custom mode — second path through Phase 2b ────────────────
+        # Honors spec §3 line 163's "or fill in free-text alternatives"
+        # clause and plan line 2919's "custom origin/axes inputs". Without
+        # this path, a non-PCB user has no way to declare their frame.
+        # Reset to phase-2b and re-fill with the custom-anchors textarea.
+        page.evaluate("""() => {
+            document.getElementById('phase-2c').hidden = true;
+            document.getElementById('phase-2b').hidden = false;
+            window.spatialState.frame = null;
+        }""")
+
+        page.locator("#phase-2b select.frame-preset").select_option(value="custom")
+        # Custom mode reveals the anchor-definitions textarea.
+        custom_row = page.locator("#phase-2b-custom-anchors-row")
+        page.wait_for_function(
+            "() => !document.getElementById('phase-2b-custom-anchors-row').hidden",
+            timeout=2_000,
+        )
+        assert custom_row.is_visible(), "Custom-anchors row must show when Custom preset selected"
+
+        custom_textarea = page.locator("#phase-2b-custom-anchors")
+        custom_textarea.fill(
+            "# example custom frame\norigin: 0, 0, 0\ntip_x: 50.0, 0, 0\ntip_y: 0, 25.5, 0\n"
+        )
+        page.locator("#phase-2b-next").click()
+
+        page.wait_for_selector("#phase-2c:not([hidden])", timeout=2_000)
+        custom_frame = page.evaluate("() => window.spatialState.frame")
+        assert custom_frame.get("preset") == "custom"
+        custom_by_id = {a["id"]: a["xyz"] for a in custom_frame.get("anchors", [])}
+        assert custom_by_id == {
+            "origin": [0, 0, 0],
+            "tip_x": [50.0, 0, 0],
+            "tip_y": [0, 25.5, 0],
+        }, f"custom anchor parse mismatch: {custom_by_id!r}"
     finally:
         cli.start_server = orig_start_server  # type: ignore[assignment]
         if cli_thread.is_alive():

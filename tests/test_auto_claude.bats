@@ -1397,3 +1397,336 @@ JSON
     [[ "$status" -eq 0 ]]
     [[ -f "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" ]]
 }
+
+# ---- sibling_worktrees -------------------------------------------------
+#
+# These tests use real `git worktree add` against the per-test sandbox,
+# which gives us authentic porcelain output. Each test cleans up its
+# worktree; teardown removes the whole TEST_REPO regardless.
+
+@test "sibling_worktrees_list returns empty when no siblings exist" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/sibling_worktrees.sh"
+    run sibling_worktrees_list
+    [[ "$status" -eq 0 ]]
+    [[ -z "$output" ]]
+}
+
+@test "sibling_worktrees_has_active is false when no siblings" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/sibling_worktrees.sh"
+    run sibling_worktrees_has_active
+    [[ "$status" -ne 0 ]]
+}
+
+@test "sibling_worktrees_list finds a sibling worktree with a fresh lock" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/sibling_worktrees.sh"
+    # Create a sibling worktree and write a fresh lock there.
+    sib_dir="${TEST_REPO}-sibling"
+    git -C "$TEST_REPO" worktree add -b feat/sibling "$sib_dir" >/dev/null 2>&1
+    mkdir -p "$sib_dir/.handoff"
+    boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo "test-boot")
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    cat > "$sib_dir/.handoff/.lock" <<JSON
+{
+  "session_id": "sibling-sess-1",
+  "pid": $$,
+  "ppid": 1,
+  "host": "test-host",
+  "boot_id": "$boot",
+  "started_at": "$now",
+  "heartbeat_at": "$now",
+  "current_branch": "feat/sibling",
+  "current_task_id": "TASK-SIB",
+  "phase": "editing"
+}
+JSON
+    run sibling_worktrees_list 600
+    [[ "$status" -eq 0 ]]
+    # We expect one row, tab-separated, with the sibling path in field 1.
+    [[ "$output" == *"$sib_dir"* ]]
+    [[ "$output" == *"feat/sibling"* ]]
+    [[ "$output" == *"TASK-SIB"* ]]
+    # Cleanup
+    git -C "$TEST_REPO" worktree remove --force "$sib_dir" >/dev/null 2>&1 || rm -rf "$sib_dir"
+}
+
+@test "sibling_worktrees_list ignores a sibling whose lock heartbeat is stale" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/sibling_worktrees.sh"
+    sib_dir="${TEST_REPO}-sibling"
+    git -C "$TEST_REPO" worktree add -b feat/sibling "$sib_dir" >/dev/null 2>&1
+    mkdir -p "$sib_dir/.handoff"
+    boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo "test-boot")
+    # Heartbeat 2 hours ago — outside the 600s default window.
+    stale=$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+    cat > "$sib_dir/.handoff/.lock" <<JSON
+{
+  "session_id": "sibling-sess-1",
+  "pid": $$,
+  "host": "test-host",
+  "boot_id": "$boot",
+  "started_at": "$stale",
+  "heartbeat_at": "$stale",
+  "current_branch": "feat/sibling",
+  "current_task_id": "TASK-SIB",
+  "phase": "editing"
+}
+JSON
+    run sibling_worktrees_list 600
+    [[ "$status" -eq 0 ]]
+    [[ -z "$output" ]]
+    git -C "$TEST_REPO" worktree remove --force "$sib_dir" >/dev/null 2>&1 || rm -rf "$sib_dir"
+}
+
+@test "sibling_worktrees_list ignores a sibling whose lock PID is dead" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/sibling_worktrees.sh"
+    sib_dir="${TEST_REPO}-sibling"
+    git -C "$TEST_REPO" worktree add -b feat/sibling "$sib_dir" >/dev/null 2>&1
+    mkdir -p "$sib_dir/.handoff"
+    boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo "test-boot")
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    # PID 999999999 — definitely not running on a normal box.
+    cat > "$sib_dir/.handoff/.lock" <<JSON
+{
+  "session_id": "sibling-sess-1",
+  "pid": 999999999,
+  "host": "test-host",
+  "boot_id": "$boot",
+  "started_at": "$now",
+  "heartbeat_at": "$now",
+  "current_branch": "feat/sibling",
+  "current_task_id": "TASK-SIB",
+  "phase": "editing"
+}
+JSON
+    run sibling_worktrees_list 600
+    [[ "$status" -eq 0 ]]
+    [[ -z "$output" ]]
+    git -C "$TEST_REPO" worktree remove --force "$sib_dir" >/dev/null 2>&1 || rm -rf "$sib_dir"
+}
+
+@test "sibling_worktrees_list tolerates a sibling with no .handoff dir" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/sibling_worktrees.sh"
+    sib_dir="${TEST_REPO}-bare-sibling"
+    git -C "$TEST_REPO" worktree add -b feat/bare "$sib_dir" >/dev/null 2>&1
+    # No .handoff at all in the sibling — must not error.
+    run sibling_worktrees_list 600
+    [[ "$status" -eq 0 ]]
+    [[ -z "$output" ]]
+    git -C "$TEST_REPO" worktree remove --force "$sib_dir" >/dev/null 2>&1 || rm -rf "$sib_dir"
+}
+
+@test "sibling_worktrees_format emits human-readable warning when active" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/sibling_worktrees.sh"
+    sib_dir="${TEST_REPO}-sibling"
+    git -C "$TEST_REPO" worktree add -b feat/sibling "$sib_dir" >/dev/null 2>&1
+    mkdir -p "$sib_dir/.handoff"
+    boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo "test-boot")
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    cat > "$sib_dir/.handoff/.lock" <<JSON
+{
+  "session_id": "sibling-sess-1",
+  "pid": $$,
+  "host": "test-host",
+  "boot_id": "$boot",
+  "started_at": "$now",
+  "heartbeat_at": "$now",
+  "current_branch": "feat/sibling",
+  "current_task_id": "TASK-SIB",
+  "phase": "editing"
+}
+JSON
+    run sibling_worktrees_format 600
+    [[ "$status" -eq 0 ]]
+    [[ "$output" == *"WARNING: detected concurrent orchestrator activity"* ]]
+    [[ "$output" == *"DO NOT \`git checkout\`"* ]]
+    [[ "$output" == *"feat/sibling"* ]]
+    git -C "$TEST_REPO" worktree remove --force "$sib_dir" >/dev/null 2>&1 || rm -rf "$sib_dir"
+}
+
+# ---- session brief hook ------------------------------------------------
+
+# Helper: copy the SessionStart hook into the sandbox so it can resolve its
+# own relative path to the sandbox scripts.
+_install_session_brief_hook() {
+    mkdir -p "$AUTO_CLAUDE_REPO_ROOT/.claude/hooks"
+    cp "$REAL_REPO_ROOT/.claude/hooks/auto_claude_session_brief.sh" \
+        "$AUTO_CLAUDE_REPO_ROOT/.claude/hooks/auto_claude_session_brief.sh"
+    chmod +x "$AUTO_CLAUDE_REPO_ROOT/.claude/hooks/auto_claude_session_brief.sh"
+}
+
+@test "session_brief hook exits 0 silently when state.json missing" {
+    _install_session_brief_hook
+    rm -f "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json"
+    run env CLAUDE_PROJECT_DIR="$AUTO_CLAUDE_REPO_ROOT" \
+        "$AUTO_CLAUDE_REPO_ROOT/.claude/hooks/auto_claude_session_brief.sh"
+    [[ "$status" -eq 0 ]]
+    [[ -z "$output" ]]
+}
+
+@test "session_brief hook prints the banner and STATUS content when state.json exists" {
+    _install_session_brief_hook
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    state_init
+    run env CLAUDE_PROJECT_DIR="$AUTO_CLAUDE_REPO_ROOT" \
+        "$AUTO_CLAUDE_REPO_ROOT/.claude/hooks/auto_claude_session_brief.sh"
+    [[ "$status" -eq 0 ]]
+    [[ "$output" == *"=== auto-claude status brief"* ]]
+    [[ "$output" == *"=== end auto-claude brief ==="* ]]
+    [[ "$output" == *"## Current"* ]]
+    [[ "$output" == *"## Recent events"* ]]
+}
+
+@test "session_brief hook surfaces cross-orchestrator warning when sibling lock fresh" {
+    _install_session_brief_hook
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    state_init
+
+    # Plant an active sibling worktree.
+    sib_dir="${TEST_REPO}-sibling"
+    git -C "$TEST_REPO" worktree add -b feat/sibling "$sib_dir" >/dev/null 2>&1
+    mkdir -p "$sib_dir/.handoff"
+    boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo "test-boot")
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    cat > "$sib_dir/.handoff/.lock" <<JSON
+{"session_id":"sibling-sess","pid":$$,"host":"h","boot_id":"$boot","started_at":"$now","heartbeat_at":"$now","current_branch":"feat/sibling","current_task_id":"TASK-SIB","phase":"editing"}
+JSON
+
+    run env CLAUDE_PROJECT_DIR="$AUTO_CLAUDE_REPO_ROOT" \
+        "$AUTO_CLAUDE_REPO_ROOT/.claude/hooks/auto_claude_session_brief.sh"
+    [[ "$status" -eq 0 ]]
+    [[ "$output" == *"## Cross-orchestrator alert"* ]]
+    [[ "$output" == *"WARNING: detected concurrent orchestrator activity"* ]]
+    [[ "$output" == *"feat/sibling"* ]]
+
+    git -C "$TEST_REPO" worktree remove --force "$sib_dir" >/dev/null 2>&1 || rm -rf "$sib_dir"
+}
+
+@test "session_brief hook never fails the session even on a corrupt lock" {
+    _install_session_brief_hook
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    state_init
+    sib_dir="${TEST_REPO}-sibling"
+    git -C "$TEST_REPO" worktree add -b feat/sibling "$sib_dir" >/dev/null 2>&1
+    mkdir -p "$sib_dir/.handoff"
+    # Garbage in the lock file
+    echo "this is not json {" > "$sib_dir/.handoff/.lock"
+    run env CLAUDE_PROJECT_DIR="$AUTO_CLAUDE_REPO_ROOT" \
+        "$AUTO_CLAUDE_REPO_ROOT/.claude/hooks/auto_claude_session_brief.sh"
+    [[ "$status" -eq 0 ]]
+    git -C "$TEST_REPO" worktree remove --force "$sib_dir" >/dev/null 2>&1 || rm -rf "$sib_dir"
+}
+
+# ---- session_boot sibling-orchestrator alerts --------------------------
+
+@test "session_boot audits alert_sibling_orchestrator_active when sibling lock fresh (different branch)" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"pending","branch":"feat/t","attempts":0,"depends_on":[]}
+  ],
+  "current_lease": null
+}
+JSON
+    # Create a sibling worktree on a DIFFERENT branch with a fresh lock.
+    sib_dir="${TEST_REPO}-sibling"
+    git -C "$TEST_REPO" worktree add -b feat/sibling-other "$sib_dir" >/dev/null 2>&1
+    mkdir -p "$sib_dir/.handoff"
+    boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo "test-boot")
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    cat > "$sib_dir/.handoff/.lock" <<JSON
+{"session_id":"sib","pid":$$,"host":"h","boot_id":"$boot","started_at":"$now","heartbeat_at":"$now","current_branch":"feat/sibling-other","current_task_id":"TASK-OTHER","phase":"editing"}
+JSON
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    AUTO_CLAUDE_MOCK_CLAUDE=1 run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/session_boot.sh" TASK-1
+    [[ "$status" -eq 0 ]]
+    # Soft alert recorded
+    run grep -c '"type":"alert_sibling_orchestrator_active"' "$AUTO_CLAUDE_REPO_ROOT/.handoff/events.jsonl"
+    [[ "$output" -ge 1 ]]
+    git -C "$TEST_REPO" worktree remove --force "$sib_dir" >/dev/null 2>&1 || rm -rf "$sib_dir"
+}
+
+@test "session_boot refuses and audits alert_sibling_branch_conflict when sibling holds same branch" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"pending","branch":"feat/collide","attempts":0,"depends_on":[]}
+  ],
+  "current_lease": null
+}
+JSON
+    # Sibling worktree already on feat/collide.
+    sib_dir="${TEST_REPO}-sibling"
+    git -C "$TEST_REPO" worktree add -b feat/collide "$sib_dir" >/dev/null 2>&1
+    mkdir -p "$sib_dir/.handoff"
+    boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo "test-boot")
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    cat > "$sib_dir/.handoff/.lock" <<JSON
+{"session_id":"sib","pid":$$,"host":"h","boot_id":"$boot","started_at":"$now","heartbeat_at":"$now","current_branch":"feat/collide","current_task_id":"TASK-COLL","phase":"editing"}
+JSON
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    AUTO_CLAUDE_MOCK_CLAUDE=1 run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/session_boot.sh" TASK-1
+    [[ "$status" -ne 0 ]]
+    run grep -c '"type":"alert_sibling_branch_conflict"' "$AUTO_CLAUDE_REPO_ROOT/.handoff/events.jsonl"
+    [[ "$output" -ge 1 ]]
+    git -C "$TEST_REPO" worktree remove --force "$sib_dir" >/dev/null 2>&1 || rm -rf "$sib_dir"
+}
+
+# ---- status_render polish ---------------------------------------------
+
+@test "status_render shows human heartbeat age when a lock exists" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    state_init
+    # Plant a lock with a known recent heartbeat.
+    boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo "test-boot")
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/.lock" <<JSON
+{"session_id":"s","pid":$$,"host":"h","boot_id":"$boot","started_at":"$now","heartbeat_at":"$now","current_branch":"main","current_task_id":"X","phase":"editing"}
+JSON
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/status_render.sh" --stdout
+    [[ "$status" -eq 0 ]]
+    # Output should contain the parenthetical age suffix.
+    [[ "$output" == *"ago)"* ]]
+    rm -f "$AUTO_CLAUDE_REPO_ROOT/.handoff/.lock"
+}
+
+@test "status_render falls back to static inference when no watchdog events yet" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    # state.json has one pending task but events.jsonl has no
+    # watchdog_decision events — status_render must still produce a
+    # non-empty 'Why nothing is running right now' line.
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"pending","branch":"feat/t","attempts":0,"depends_on":[]}
+  ],
+  "current_lease": null
+}
+JSON
+    : > "$AUTO_CLAUDE_REPO_ROOT/.handoff/events.jsonl"
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/status_render.sh" --stdout
+    [[ "$status" -eq 0 ]]
+    [[ "$output" == *"watchdog_not_yet_run"* ]]
+}
+
+@test "status_render reports session_active when a lease is held" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"leased","branch":"feat/t","attempts":1,"depends_on":[]}
+  ],
+  "current_lease": {
+    "task_id":"TASK-1","session_id":"sess-x","branch":"feat/t","head_sha_at_lease_start":"deadbeef","cwd_root":"/tmp","acquired_at":"2026-05-04T05:00:00Z"
+  }
+}
+JSON
+    : > "$AUTO_CLAUDE_REPO_ROOT/.handoff/events.jsonl"
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/status_render.sh" --stdout
+    [[ "$status" -eq 0 ]]
+    [[ "$output" == *"session_active"* ]]
+}

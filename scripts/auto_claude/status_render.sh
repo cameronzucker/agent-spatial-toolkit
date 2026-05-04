@@ -13,6 +13,21 @@ export AUTO_CLAUDE_REPO_ROOT
 # shellcheck source=state_helpers.sh
 source "$SCRIPT_DIR/state_helpers.sh"
 
+# Format a number of seconds as a coarse human age. Matches the format
+# produced by sibling_worktrees.sh so the two surfaces feel consistent.
+_status_age_human() {
+    local s="$1"
+    if (( s < 60 )); then
+        printf '%ds\n' "$s"
+    elif (( s < 3600 )); then
+        printf '%dm\n' $(( s / 60 ))
+    elif (( s < 86400 )); then
+        printf '%dh%dm\n' $(( s / 3600 )) $(( (s % 3600) / 60 ))
+    else
+        printf '%dd%dh\n' $(( s / 86400 )) $(( (s % 86400) / 3600 ))
+    fi
+}
+
 usage() {
     cat <<'EOF'
 status_render.sh — regenerate .handoff/STATUS.md
@@ -72,7 +87,19 @@ render() {
     if [[ -f "$LOCK" ]]; then
         local hb
         hb=$(jq -r '.heartbeat_at // "?"' "$LOCK" 2>/dev/null || echo "?")
-        echo "- Last heartbeat: $hb"
+        # Compute heartbeat age in human terms — easier to triage at a
+        # glance than a raw ISO timestamp ("2 minutes ago" beats parsing
+        # 2026-05-04T05:13:42Z by eye).
+        local hb_epoch now_epoch age age_h
+        if hb_epoch=$(date -u -d "$hb" +%s 2>/dev/null); then
+            now_epoch=$(date -u +%s)
+            age=$(( now_epoch - hb_epoch ))
+            (( age < 0 )) && age=0
+            age_h="$(_status_age_human "$age")"
+            echo "- Last heartbeat: $hb (${age_h} ago)"
+        else
+            echo "- Last heartbeat: $hb"
+        fi
     else
         echo "- Last heartbeat: (no lock)"
     fi
@@ -135,20 +162,36 @@ render() {
 
     echo ""
     echo "## Why nothing is running right now"
-    # Best-effort: use the most recent watchdog_decision event
+    # Prefer the most recent watchdog_decision event — that's the framework's
+    # own self-diagnosis. Fall back to inferring from state.json if the
+    # watchdog hasn't run yet, so a brand-new install still shows something
+    # useful instead of "(has the watchdog run?)".
+    local last_decision=""
     if [[ -f "$EVENTS" ]]; then
-        local last_decision
         last_decision=$(grep '"type":"watchdog_decision"' "$EVENTS" | tail -1 || echo "")
-        if [[ -n "$last_decision" ]]; then
-            local d r
-            d=$(jq -r '.decision // "?"' <<<"$last_decision")
-            r=$(jq -r '.reason // ""' <<<"$last_decision")
-            echo "$d: $r"
+    fi
+    if [[ -n "$last_decision" ]]; then
+        local d r
+        d=$(jq -r '.decision // "?"' <<<"$last_decision")
+        r=$(jq -r '.reason // ""' <<<"$last_decision")
+        echo "- $d: $r"
+    elif [[ -f "$sp" ]]; then
+        # Static inference from state. Order matters: check most-specific first.
+        local has_lease pending_count blocked_count
+        has_lease=$(jq -r '.current_lease // "null"' "$sp")
+        pending_count=$(jq '[.tasks[] | select(.status == "pending")] | length' "$sp")
+        blocked_count=$(jq '[.tasks[] | select(.status == "blocked")] | length' "$sp")
+        if [[ "$has_lease" != "null" ]]; then
+            echo "- session_active: a lease is held; the watchdog will not spawn a successor while a session is in flight"
+        elif (( pending_count == 0 && blocked_count > 0 )); then
+            echo "- quiescent: no pending tasks ($blocked_count blocked); add a task or unblock an existing one"
+        elif (( pending_count == 0 )); then
+            echo "- quiescent: no pending tasks (and no blocked tasks); backlog is empty"
         else
-            echo "(no watchdog_decision events yet — has the watchdog run?)"
+            echo "- watchdog_not_yet_run: $pending_count pending task(s) but no watchdog_decision events on record yet — run scripts/auto_claude/watchdog.sh (or wait for cron)"
         fi
     else
-        echo "(no events recorded)"
+        echo "- (no state.json present — run scripts/auto_claude/install.sh)"
     fi
 }
 

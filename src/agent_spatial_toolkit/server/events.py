@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -46,17 +47,25 @@ class EventLog:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
-    def write(self, event: dict[str, Any]) -> None:
+    def write(self, event: dict[str, Any], *, fsync: bool = False) -> None:
         """Append one event as a JSON line, injecting ``ts``.
 
         ``ts`` is set to ``datetime.now(timezone.utc)`` formatted as
         ``YYYY-MM-DDTHH:MM:SS.ffffffZ`` (microsecond precision, ``Z``
         suffix). If ``event`` already contains a ``ts`` key, it is
         overwritten — the writer owns timestamps.
+
+        When *fsync* is ``True``, the write is flushed and
+        ``os.fsync()``'d before returning — guaranteeing durability even
+        if the process crashes immediately after. Default is ``False``
+        (best-effort, matching historical behavior).
         """
         record = {**event, "ts": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")}
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
+            if fsync:
+                f.flush()
+                os.fsync(f.fileno())
 
     def replay(self) -> Iterable[dict[str, Any]]:
         """Yield each recorded event in insertion order.

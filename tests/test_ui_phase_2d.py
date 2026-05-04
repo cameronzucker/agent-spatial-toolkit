@@ -231,6 +231,15 @@ def test_phase_2d_feature_click_and_label_happy_path(
         row_text = feature_row.text_content() or ""
         assert "usb_c" in row_text, f"Expected 'usb_c' in feature row: {row_text!r}"
         assert "mm" in row_text, f"Expected xyz_mm formatted text: {row_text!r}"
+        # Regression guard: cross-model review of PR #48 caught that the
+        # client read resp.data.xyz_mm but the server returns pcb_xyz_mm.
+        # The bug surfaced as every row showing (0.0, 0.0, 0.0) mm with no
+        # error. Assert the displayed xyz is not all-zero — a click at canvas
+        # center on the synthetic card with a real pose must ray-cast to a
+        # non-zero point in the part frame.
+        assert "(0.0, 0.0, 0.0)" not in row_text, (
+            f"Feature row shows all-zero xyz; client may be reading wrong response key: {row_text!r}"
+        )
 
         # Next button must enable after at least one feature is recorded
         next_btn = page.locator("#phase-2d-next")

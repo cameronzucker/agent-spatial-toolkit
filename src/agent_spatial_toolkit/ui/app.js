@@ -1022,10 +1022,29 @@
             return;
         }
 
+        // Block duplicate feature_id to avoid silent data loss in PR-α.
+        // Two distinct labels can normalize to the same id ("USB-C" + "usb_c").
+        // The "create new vs link to existing" gate ships in PR-β/γ; until
+        // then, force the user to disambiguate.
+        if (window.spatialState.features[featureId]) {
+            statusEl.className = 'phase-2d-status error';
+            statusEl.textContent =
+                'Label "' + rawLabel + '" maps to feature_id "' + featureId +
+                '" which already exists. Pick a different label.';
+            return;
+        }
+
+        // Snapshot per-click data so an in-flight POST can't have its success
+        // handler steal a later click's pixel/label (state.pendingPixel is
+        // mutable and the user could click again before this fetch resolves).
+        var snapshotPixel = [state.pendingPixel.x, state.pendingPixel.y];
+        var snapshotLabel = rawLabel;
+        var snapshotFeatureId = featureId;
+
         var body = {
-            feature_id: featureId,
+            feature_id: snapshotFeatureId,
             photo_id: photoId,
-            pixel: [state.pendingPixel.x, state.pendingPixel.y],
+            pixel: snapshotPixel,
         };
 
         addBtn.disabled = true;
@@ -1047,39 +1066,51 @@
                     addBtn.disabled = false;
                     return;
                 }
-                // Record on spatialState
-                window.spatialState.features[featureId] = {
-                    label: rawLabel,
+                // Server returns {pcb_xyz_mm: [x, y, z]} (per server/app.py:521).
+                // Earlier draft of this code read .xyz_mm — bug caught in
+                // cross-model review of PR #48; fixed before merge.
+                var xyz = resp.data.pcb_xyz_mm || [0, 0, 0];
+                // Record on spatialState (uses snapshots to avoid stealing a
+                // later click's data).
+                window.spatialState.features[snapshotFeatureId] = {
+                    label: snapshotLabel,
                     photoId: photoId,
-                    pixel: [state.pendingPixel.x, state.pendingPixel.y],
-                    xyz_mm: resp.data.xyz_mm,
-                    method: resp.data.method,
+                    pixel: snapshotPixel,
+                    pcb_xyz_mm: xyz,
+                    method: 'planar_intersection',
                 };
                 // Append a <li> to the features list for this photo
                 var li = document.createElement('li');
                 li.className = 'phase-2d-feature-row';
-                li.dataset.featureId = featureId;
+                li.dataset.featureId = snapshotFeatureId;
                 var labelSpan = document.createElement('span');
                 labelSpan.className = 'phase-2d-feature-label';
-                labelSpan.textContent = rawLabel;
+                labelSpan.textContent = snapshotLabel;
                 li.appendChild(labelSpan);
                 var xyzSpan = document.createElement('span');
                 xyzSpan.className = 'phase-2d-feature-xyz';
-                var xyz = resp.data.xyz_mm || [0, 0, 0];
                 xyzSpan.textContent = ' → (' +
                     Number(xyz[0]).toFixed(1) + ', ' +
                     Number(xyz[1]).toFixed(1) + ', ' +
-                    Number(xyz[2]).toFixed(1) + ') mm';
+                    Number(xyz[2]).toFixed(1) + ') mm (PCB top, z=0 assumed)';
                 li.appendChild(xyzSpan);
                 featuresList.appendChild(li);
 
-                // Reset per-card state for the next click
-                state.pendingPixel = null;
+                // Reset per-card state for the next click. Only clear if the
+                // pendingPixel still points at this click's pixel — if the
+                // user has already clicked elsewhere mid-fetch, leave it.
+                if (
+                    state.pendingPixel &&
+                    state.pendingPixel.x === snapshotPixel[0] &&
+                    state.pendingPixel.y === snapshotPixel[1]
+                ) {
+                    state.pendingPixel = null;
+                }
                 labelInput.value = '';
                 addBtn.disabled = true;
 
                 statusEl.className = 'phase-2d-status success';
-                statusEl.textContent = 'Feature added. Click again to add another.';
+                statusEl.textContent = 'Feature added. Click on the photo again to add another (PCB top plane assumed).';
 
                 // Refresh autocomplete pools across all cards (the new label
                 // should be suggestable on other photos too). Cheapest path:

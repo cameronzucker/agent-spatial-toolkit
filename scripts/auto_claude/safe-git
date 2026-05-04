@@ -74,9 +74,35 @@ if [[ $# -eq 0 || "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     exit 0
 fi
 
-# Categorize the subcommand. The first non-flag arg is the subcommand.
-# (We don't support pre-subcommand options like `git -c foo=bar` here; if a
-# caller needs that, they should set them via env or use real git directly.)
+# Categorize the subcommand. The first arg MUST be the subcommand itself —
+# pre-subcommand flags (e.g. `git -C /tmp ...`, `git --git-dir=...`,
+# `git -c foo=bar ...`) are explicitly refused. Allowing them would let a
+# caller bypass the cwd / branch / blacklist guards by:
+#   - `-C <dir>` redirecting the operation to another worktree
+#   - `--git-dir=` / `--work-tree=` rebinding the repo paths
+#   - `-c core.hooksPath=...` overriding the pre-commit hook
+#   - `-c safe.directory=*` / namespace / paginate / exec-path tricks
+# v1 ships an allowlist-of-none: any arg that starts with `-` before the
+# subcommand is rejected. Audited as `git_refused {reason: pre-subcommand-flag-not-allowed}`.
+_pre_refuse() {
+    local flag="$1"
+    echo "safe-git: REFUSED — pre-subcommand flag '$flag' is not allowed (use the subcommand directly)" >&2
+    audit_event "git_refused" "$(jq -cn \
+        --arg flag "$flag" \
+        '{subcmd:"<pre-subcommand>", reason:"pre-subcommand-flag-not-allowed", flag:$flag}')"
+    exit 4
+}
+
+case "$1" in
+    -C|-c|-p|--paginate|--no-pager|--bare|--no-replace-objects|--literal-pathspecs|--no-optional-locks|--html-path|--man-path|--info-path)
+        _pre_refuse "$1" ;;
+    --git-dir|--git-dir=*|--work-tree|--work-tree=*|--namespace|--namespace=*|--super-prefix|--super-prefix=*|--exec-path|--exec-path=*|-c=*)
+        _pre_refuse "$1" ;;
+    -*)
+        # Catch-all for any unknown short or long flag before the subcommand.
+        _pre_refuse "$1" ;;
+esac
+
 subcmd="$1"
 shift || true
 # Use a sentinel to allow safe iteration when no remaining args. With set -u

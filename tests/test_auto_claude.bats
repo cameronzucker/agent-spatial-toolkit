@@ -256,6 +256,43 @@ JSON
     [[ "$status" -eq 0 ]]
 }
 
+@test "safe-git refuses pre-subcommand -C flag" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    state_init
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/safe-git" -C /tmp status
+    [[ "$status" -eq 4 ]]
+    [[ "$output" == *"REFUSED"* ]]
+    [[ "$output" == *"pre-subcommand"* ]]
+}
+
+@test "safe-git refuses pre-subcommand --git-dir flag" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    state_init
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/safe-git" --git-dir=/tmp/.git status
+    [[ "$status" -eq 4 ]]
+    [[ "$output" == *"pre-subcommand"* ]]
+}
+
+@test "safe-git refuses pre-subcommand -c flag (config injection)" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    state_init
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/safe-git" -c core.hooksPath=/tmp/evil status
+    [[ "$status" -eq 4 ]]
+    [[ "$output" == *"pre-subcommand"* ]]
+}
+
+@test "safe-git refuses pre-subcommand --work-tree flag" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    state_init
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/safe-git" --work-tree=/tmp status
+    [[ "$status" -eq 4 ]]
+    [[ "$output" == *"pre-subcommand"* ]]
+}
+
 @test "safe-git refuses commit when no lease and tree dirty" {
     source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
     state_init

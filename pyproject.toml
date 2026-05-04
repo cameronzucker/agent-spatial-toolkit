@@ -20,8 +20,10 @@ agent-spatial-toolkit = "agent_spatial_toolkit.cli:main"
 
 [dependency-groups]
 dev = [
+    "playwright>=1.59.0",
     "pytest>=9.0.3",
     "pytest-cov>=7.1.0",
+    "pytest-playwright>=0.7.2",
     "reportlab>=4.5.0",
     "ruff>=0.15.12",
 ]

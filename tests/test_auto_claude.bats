@@ -293,6 +293,40 @@ JSON
     [[ "$output" == *"pre-subcommand"* ]]
 }
 
+@test "safe-git config without --get is refused without lease" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    state_init
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/safe-git" config core.hooksPath /tmp/evil
+    [[ "$status" -eq 5 ]]
+}
+
+@test "safe-git config --get is allowed without lease" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    state_init
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/safe-git" config --get user.email
+    # Exit may be 0 or 1 depending on whether the value exists; both fine.
+    # What matters is it ran (not refused).
+    [[ "$status" -eq 0 || "$status" -eq 1 ]]
+}
+
+@test "safe-git config --list is allowed without lease" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    state_init
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/safe-git" config --list
+    [[ "$status" -eq 0 ]]
+}
+
+@test "safe-git fetch is refused without lease" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    state_init
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/safe-git" fetch origin
+    [[ "$status" -eq 5 ]]
+}
+
 @test "safe-git refuses commit when no lease and tree dirty" {
     source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
     state_init

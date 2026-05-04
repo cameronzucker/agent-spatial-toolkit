@@ -115,8 +115,13 @@ else
 fi
 
 # Read-only set: always allowed even without a lease.
+#
+# `config` is NOT in this set: bare `config core.hooksPath /tmp/evil` mutates
+# without a lease. `config --get*` and `config --list` are allowed via the
+# special-case below. `fetch` is also removed: it writes refs and so requires
+# a lease.
 read_only_subcmds=(status log diff show branch rev-parse reflog ls-files \
-    config remote describe blame fetch ls-remote symbolic-ref shortlog \
+    remote describe blame ls-remote symbolic-ref shortlog \
     rev-list cat-file for-each-ref name-rev tag stash help version)
 
 is_read_only=0
@@ -149,7 +154,17 @@ if [[ "$subcmd" == "stash" ]]; then
         *) is_read_only=0 ;;
     esac
 fi
-# fetch is read-only relative to working tree, but document we allow it.
+# `config` is allowed without a lease ONLY for read-only sub-actions:
+# `--get`, `--get-all`, `--get-regexp`, `--list`, `-l`. Anything else mutates
+# config and must require a lease.
+if [[ "$subcmd" == "config" ]]; then
+    case "${args[0]:-}" in
+        --get|--get-all|--get-regexp|--get-urlmatch|--list|-l)
+            is_read_only=1 ;;
+        *)
+            is_read_only=0 ;;
+    esac
+fi
 
 # ---- Hard refusals: blacklisted no matter what. -----------------------
 refuse() {

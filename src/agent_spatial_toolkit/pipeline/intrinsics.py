@@ -6,6 +6,7 @@ Tier A (chessboard calibration) is added in v0.1.0 — see chessboard.py.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -86,20 +87,13 @@ FOV_CLASS_WIDE = "wide"
 FOV_CLASS_NORMAL = "normal"
 FOV_CLASS_TELEPHOTO = "telephoto"
 
-# 35mm-equivalent focal length boundaries (mm)
-_BOUNDARIES = [
-    (22, FOV_CLASS_ULTRAWIDE),
-    (35, FOV_CLASS_WIDE),
-    (70, FOV_CLASS_NORMAL),
-    (float("inf"), FOV_CLASS_TELEPHOTO),
-]
-
 # Generic distortion profiles per FOV class.
 # These are conservative estimates — they intentionally OVER-correct slightly
 # rather than under-correct, since under-correction biases pose estimates.
 # Numbers derived empirically from chessboard calibrations of common phone
 # cameras; a derivation document is added in v0.1.0 once chessboard
 # calibration is functional and we can compute residuals against truth.
+# XXX SIGN-VALIDATE: see follow-up issue (TBD by orchestrator)
 _FOV_CLASS_DISTORTION = {
     FOV_CLASS_WIDE: [0.025, 0.000, 0.0, 0.0, 0.0],  # k1, k2, p1, p2, k3
     FOV_CLASS_NORMAL: [0.010, 0.005, 0.0, 0.0, 0.0],
@@ -146,13 +140,28 @@ class Intrinsics:
 
 
 def resolve_fov_class(focal_length_35mm_equiv: float | None) -> str | None:
-    """Map a 35mm-equivalent focal length to its FOV class label."""
-    if focal_length_35mm_equiv is None:
+    """Map a 35mm-equivalent focal length (mm) to its FOV class label.
+
+    Boundaries match spec §5.2 prose:
+      <22 mm     → ultrawide
+      22-35 mm   → wide
+      35-70 mm   → normal
+      >70 mm     → telephoto
+
+    The 22 boundary is exclusive on the ultrawide side (22 mm itself is
+    classified as wide); the 70 boundary is inclusive on the normal side
+    (70 mm itself is classified as normal). 35 mm is inclusive on the
+    normal side per the same convention.
+    """
+    if focal_length_35mm_equiv is None or not math.isfinite(focal_length_35mm_equiv):
         return None
-    for boundary, cls in _BOUNDARIES:
-        if focal_length_35mm_equiv < boundary:
-            return cls
-    return FOV_CLASS_TELEPHOTO  # unreachable given inf boundary, defensive
+    if focal_length_35mm_equiv < 22.0:
+        return FOV_CLASS_ULTRAWIDE
+    if focal_length_35mm_equiv < 35.0:
+        return FOV_CLASS_WIDE
+    if focal_length_35mm_equiv <= 70.0:
+        return FOV_CLASS_NORMAL
+    return FOV_CLASS_TELEPHOTO
 
 
 def resolve_fallback_intrinsics(
@@ -161,17 +170,28 @@ def resolve_fallback_intrinsics(
 ) -> Intrinsics | None:
     """Compute fallback intrinsics from a 35mm-equivalent focal length.
 
-    Returns None for ultrawide lenses (per spec §5.2: rejected). Caller is
-    responsible for surfacing the rejection to the user.
+    Returns None for ultrawide lenses (per spec §5.2: rejected), for non-finite
+    focal lengths, and for non-positive image dimensions. Caller is responsible
+    for surfacing the rejection to the user.
+
+    The 35mm-equivalent focal length is referenced to the 36 mm long edge of a
+    full-frame sensor; we use ``max(width, height)`` so the result is
+    independent of image orientation.
     """
+    width, height = image_size
+    if width <= 0 or height <= 0:
+        return None
+
     fov_class = resolve_fov_class(focal_length_35mm_equiv)
     if fov_class is None or fov_class == FOV_CLASS_ULTRAWIDE:
         return None
 
-    width, height = image_size
     # Convert 35mm-equiv focal to absolute pixels.
-    # 35mm-equivalent uses a 36mm-wide reference sensor; pixel focal = focal_mm * (image_width_px / 36mm)
-    fx_px = focal_length_35mm_equiv * width / 36.0
+    # 35mm-equivalent references the 36 mm long edge of a full-frame sensor;
+    # pixel focal = focal_mm * (long_edge_px / 36mm). Using max() keeps the
+    # result orientation-independent (portrait vs landscape of the same shot).
+    long_edge = max(width, height)
+    fx_px = focal_length_35mm_equiv * long_edge / 36.0
     fy_px = fx_px  # square pixels assumption
 
     return Intrinsics(

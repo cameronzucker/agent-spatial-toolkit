@@ -132,7 +132,8 @@ def test_extract_exif_unknown_format_returns_none(tmp_path: Path) -> None:
         (35, FOV_CLASS_NORMAL),
         (50, FOV_CLASS_NORMAL),
         (69, FOV_CLASS_NORMAL),
-        (70, FOV_CLASS_TELEPHOTO),
+        (70, FOV_CLASS_NORMAL),
+        (70.001, FOV_CLASS_TELEPHOTO),
         (135, FOV_CLASS_TELEPHOTO),
         (300, FOV_CLASS_TELEPHOTO),
     ],
@@ -145,6 +146,40 @@ def test_resolve_fov_class(focal_35mm: float, expected_class: str) -> None:
 def test_resolve_fov_class_none_returns_none() -> None:
     """No focal length → no class."""
     assert resolve_fov_class(None) is None
+
+
+def test_resolve_fov_class_rejects_nan() -> None:
+    """NaN focal length is treated as missing, not classified."""
+    assert resolve_fov_class(float("nan")) is None
+
+
+def test_resolve_fov_class_rejects_inf() -> None:
+    """Infinite focal length is treated as missing, not classified."""
+    assert resolve_fov_class(float("inf")) is None
+
+
+def test_resolve_fallback_intrinsics_rejects_nan() -> None:
+    """NaN focal length yields None, not NaN-laced Intrinsics."""
+    assert resolve_fallback_intrinsics(float("nan"), (4032, 3024)) is None
+
+
+def test_resolve_fallback_intrinsics_rejects_zero_dimensions() -> None:
+    """Zero or negative image dimensions yield None."""
+    assert resolve_fallback_intrinsics(50.0, (0, 3024)) is None
+    assert resolve_fallback_intrinsics(50.0, (4032, 0)) is None
+    assert resolve_fallback_intrinsics(50.0, (-1, 3024)) is None
+
+
+def test_resolve_fallback_intrinsics_orientation_independent() -> None:
+    """Same focal+pixel-count produces same fx in either orientation."""
+    landscape = resolve_fallback_intrinsics(50.0, (4032, 3024))
+    portrait = resolve_fallback_intrinsics(50.0, (3024, 4032))
+    assert landscape is not None and portrait is not None
+    assert landscape.fx_px == pytest.approx(portrait.fx_px)
+    assert landscape.fy_px == pytest.approx(portrait.fy_px)
+    # Principal point still tracks the supplied dimensions
+    assert landscape.cx == pytest.approx(2016.0)
+    assert portrait.cx == pytest.approx(1512.0)
 
 
 def test_resolve_fallback_intrinsics_telephoto() -> None:
@@ -181,8 +216,10 @@ def test_resolve_fallback_intrinsics_normal_focal() -> None:
     # 50mm equiv on 4032px wide sensor: fx = 50/36 * 4032 = 5600 px
     # (using 36mm reference width for 35mm-equivalent)
     assert intrinsics.fx_px == pytest.approx(5600.0, rel=0.01)
-    # Mild distortion for "normal" class
-    assert intrinsics.distortion[0] != 0.0  # k1 nonzero
+    # Pinned to the plan's literal value. The sign convention (positive k1 →
+    # pincushion in OpenCV's model) is flagged for validation against
+    # chessboard ground truth in Tier A — see issue tracker.
+    assert intrinsics.distortion == [0.010, 0.005, 0.0, 0.0, 0.0]
 
 
 def test_intrinsics_dataclass_serializes_to_dict() -> None:

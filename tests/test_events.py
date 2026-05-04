@@ -36,3 +36,41 @@ def test_event_log_replay(tmp_path: Path) -> None:
     assert len(events) == 2
     assert events[0]["n"] == 1
     assert events[1]["n"] == 2
+
+
+def test_event_log_replay_on_missing_file_yields_nothing(tmp_path: Path) -> None:
+    """A replay() against a never-written path yields zero events, not an error."""
+    log = EventLog(tmp_path / "events.jsonl")
+    events = list(log.replay())
+    assert events == []
+
+
+def test_event_log_replay_skips_blank_lines(tmp_path: Path) -> None:
+    """Blank lines in the file are silently skipped during replay."""
+    log_path = tmp_path / "events.jsonl"
+    log = EventLog(log_path)
+    log.write({"type": "first"})
+    log_path.write_text(log_path.read_text() + "\n\n   \n", encoding="utf-8")
+    log.write({"type": "second"})
+    events = list(log.replay())
+    assert [e["type"] for e in events] == ["first", "second"]
+
+
+def test_event_log_write_does_not_mutate_caller_dict(tmp_path: Path) -> None:
+    """write() injects ts on a copy; the caller's dict is unchanged."""
+    log = EventLog(tmp_path / "events.jsonl")
+    event = {"type": "anchor_clicked", "anchor_id": "o"}
+    log.write(event)
+    assert "ts" not in event
+    assert event == {"type": "anchor_clicked", "anchor_id": "o"}
+
+
+def test_event_log_multi_instance_appends(tmp_path: Path) -> None:
+    """A second EventLog at the same path appends; doesn't truncate."""
+    log_path = tmp_path / "events.jsonl"
+    log_a = EventLog(log_path)
+    log_a.write({"type": "first"})
+    log_b = EventLog(log_path)
+    log_b.write({"type": "second"})
+    events = list(log_b.replay())
+    assert [e["type"] for e in events] == ["first", "second"]

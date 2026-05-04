@@ -75,7 +75,7 @@
     var MAX_DIMENSION_MM = 10_000;
 
     // Initialize global wizard state. Subsequent phases read this.
-    window.spatialState = window.spatialState || { photos: {}, frame: null };
+    window.spatialState = window.spatialState || { photos: {}, frame: null, features: {} };
 
     function init() {
         // Wire phase controls FIRST, independent of /api/state. Without this,
@@ -295,6 +295,7 @@
         wirePhase2a();
         wirePhase2b();
         wirePhase2c();
+        wirePhase2d();
     }
 
     function wirePhase2a() {
@@ -831,6 +832,269 @@
                 resultEl.className = 'phase-2c-result error';
                 resultEl.textContent = 'Network error: ' + err.message;
                 if (solveBtn) solveBtn.disabled = false;
+            });
+    }
+
+    // Phase 2d — feature labeling. For each photo with a solved pose:
+    // captureClick on the canvas, then text input for the label, then POST
+    // /api/feature. Server ray-casts the click into part-local coordinates
+    // and returns xyz_mm. Successful clicks append to a per-photo features
+    // panel and push the label into a session-local autocomplete pool.
+    //
+    // Spec §3 Phase 2d: "Click in one photo, type/pick a label". This PR-α
+    // implements the single-view single-click slice. PR-β layers in the
+    // multi-photo D1 side-by-side cycle; PR-γ adds the D3 ad-hoc dropdown.
+    function wirePhase2d() {
+        var phase2d = document.getElementById('phase-2d');
+        if (!phase2d) return;
+        var observer = new MutationObserver(function () {
+            if (!phase2d.hidden) {
+                renderPhase2dPhotos();
+                observer.disconnect();
+            }
+        });
+        observer.observe(phase2d, { attributes: true, attributeFilter: ['hidden'] });
+
+        var nextBtn = document.getElementById('phase-2d-next');
+        if (nextBtn) {
+            nextBtn.addEventListener('click', function () { advancePhase('2d', '2e'); });
+        }
+    }
+
+    function renderPhase2dPhotos() {
+        var container = document.getElementById('phase-2d-photos');
+        if (!container) return;
+        clearChildren(container);
+        var photoIds = Object.keys(window.spatialState.photos || {});
+        // Only include photos that completed Phase 2c (have a pose).
+        var posedIds = photoIds.filter(function (id) {
+            return window.spatialState.photos[id].pose;
+        });
+        if (posedIds.length === 0) {
+            var empty = document.createElement('p');
+            empty.className = 'placeholder';
+            empty.textContent = 'No photos with solved poses. Complete Phase 2c first.';
+            container.appendChild(empty);
+            return;
+        }
+        posedIds.forEach(function (photoId) {
+            container.appendChild(buildPhase2dCard(photoId));
+        });
+    }
+
+    function buildPhase2dCard(photoId) {
+        var photo = window.spatialState.photos[photoId];
+        var card = document.createElement('div');
+        card.className = 'phase-2d-card';
+        card.dataset.photoId = photoId;
+
+        var name = document.createElement('div');
+        name.className = 'phase-2d-photo-name';
+        name.textContent = photoId;
+        card.appendChild(name);
+
+        var canvas = document.createElement('canvas');
+        canvas.className = 'phase-2d-canvas';
+        card.appendChild(canvas);
+
+        // Status text — surfaces "click captured" / "submitting" / errors
+        var status = document.createElement('p');
+        status.className = 'phase-2d-status';
+        status.textContent = 'Click on the photo to capture a feature, then enter a label below.';
+        card.appendChild(status);
+
+        // Label entry row: <datalist> for autocomplete + <input> + Add button
+        var entryRow = document.createElement('div');
+        entryRow.className = 'phase-2d-entry-row';
+
+        var datalistId = 'phase-2d-labels-' + photoId.replace(/[^A-Za-z0-9_-]/g, '_');
+        var datalist = document.createElement('datalist');
+        datalist.id = datalistId;
+        // Seed from session-local pool (other photos may have labels we want
+        // to suggest).
+        repopulateLabelDatalist(datalist);
+        entryRow.appendChild(datalist);
+
+        var labelInput = document.createElement('input');
+        labelInput.type = 'text';
+        labelInput.className = 'phase-2d-label-input';
+        labelInput.placeholder = 'e.g. usb_c, gpio_pin_1';
+        labelInput.setAttribute('list', datalistId);
+        entryRow.appendChild(labelInput);
+
+        var addBtn = document.createElement('button');
+        addBtn.type = 'button';
+        addBtn.className = 'phase-2d-add-btn';
+        addBtn.textContent = 'Add feature';
+        addBtn.disabled = true;
+        entryRow.appendChild(addBtn);
+
+        card.appendChild(entryRow);
+
+        // Per-feature panel (one <li> per added feature on this photo)
+        var featuresList = document.createElement('ul');
+        featuresList.className = 'phase-2d-features-list';
+        card.appendChild(featuresList);
+
+        // Per-card state held in the closure
+        var state = {
+            pendingPixel: null,
+            imageSize: null,
+        };
+
+        function updateAddButtonState() {
+            addBtn.disabled = !(state.pendingPixel && labelInput.value.trim().length > 0);
+        }
+        labelInput.addEventListener('input', updateAddButtonState);
+
+        // Load the photo into the canvas, then arm captureClick.
+        if (window.spatialUI && photo && photo.url) {
+            window.spatialUI.loadImageToCanvas(photo.url, canvas)
+                .then(function (size) {
+                    state.imageSize = [size.width, size.height];
+                    window.spatialUI.captureClick(canvas, function (pt) {
+                        state.pendingPixel = pt;
+                        status.textContent =
+                            'Pixel captured: (' + Math.round(pt.x) + ', ' + Math.round(pt.y) +
+                            '). Enter a label and click Add.';
+                        status.className = 'phase-2d-status pending';
+                        updateAddButtonState();
+                    });
+                })
+                .catch(function (err) {
+                    status.className = 'phase-2d-status error';
+                    status.textContent = 'Failed to load photo: ' + err.message;
+                });
+        }
+
+        addBtn.addEventListener('click', function () {
+            postFeature(photoId, state, labelInput, addBtn, status, featuresList, datalist);
+        });
+
+        return card;
+    }
+
+    // Re-populate a <datalist> with the current session-local label pool.
+    // Call after every successful POST so subsequent cards see new labels.
+    function repopulateLabelDatalist(datalist) {
+        if (!datalist) return;
+        clearChildren(datalist);
+        var pool = sessionLabelPool();
+        pool.forEach(function (label) {
+            var opt = document.createElement('option');
+            opt.value = label;
+            datalist.appendChild(opt);
+        });
+    }
+
+    // Set of unique labels already used in this session (across all photos).
+    function sessionLabelPool() {
+        var seen = {};
+        var out = [];
+        var features = window.spatialState.features || {};
+        Object.keys(features).forEach(function (fid) {
+            var label = (features[fid].label || '').trim();
+            if (label && !seen[label]) {
+                seen[label] = 1;
+                out.push(label);
+            }
+        });
+        return out.sort();
+    }
+
+    // Normalize a free-text label into a feature_id (server's primary key in
+    // mem.features). Lowercase + non-alphanumeric → underscore. Collisions
+    // (two different labels mapping to the same id) are accepted in PR-α —
+    // server overwrites. PR-β/γ will add a "create new vs link to existing"
+    // gate before sending.
+    function normalizeLabelToFeatureId(label) {
+        return label.toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+    }
+
+    function postFeature(photoId, state, labelInput, addBtn, statusEl, featuresList, datalist) {
+        var rawLabel = labelInput.value.trim();
+        if (!rawLabel || !state.pendingPixel) return;
+
+        var featureId = normalizeLabelToFeatureId(rawLabel);
+        if (!featureId) {
+            statusEl.className = 'phase-2d-status error';
+            statusEl.textContent = 'Label must contain at least one alphanumeric character.';
+            return;
+        }
+
+        var body = {
+            feature_id: featureId,
+            photo_id: photoId,
+            pixel: [state.pendingPixel.x, state.pendingPixel.y],
+        };
+
+        addBtn.disabled = true;
+        statusEl.className = 'phase-2d-status pending';
+        statusEl.textContent = 'Submitting feature…';
+
+        fetch('/api/feature', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        })
+            .then(function (r) {
+                return r.json().then(function (data) { return { ok: r.ok, data: data }; });
+            })
+            .then(function (resp) {
+                if (!resp.ok) {
+                    statusEl.className = 'phase-2d-status error';
+                    statusEl.textContent = 'POST failed: ' + (resp.data.error || 'unknown error');
+                    addBtn.disabled = false;
+                    return;
+                }
+                // Record on spatialState
+                window.spatialState.features[featureId] = {
+                    label: rawLabel,
+                    photoId: photoId,
+                    pixel: [state.pendingPixel.x, state.pendingPixel.y],
+                    xyz_mm: resp.data.xyz_mm,
+                    method: resp.data.method,
+                };
+                // Append a <li> to the features list for this photo
+                var li = document.createElement('li');
+                li.className = 'phase-2d-feature-row';
+                li.dataset.featureId = featureId;
+                var labelSpan = document.createElement('span');
+                labelSpan.className = 'phase-2d-feature-label';
+                labelSpan.textContent = rawLabel;
+                li.appendChild(labelSpan);
+                var xyzSpan = document.createElement('span');
+                xyzSpan.className = 'phase-2d-feature-xyz';
+                var xyz = resp.data.xyz_mm || [0, 0, 0];
+                xyzSpan.textContent = ' → (' +
+                    Number(xyz[0]).toFixed(1) + ', ' +
+                    Number(xyz[1]).toFixed(1) + ', ' +
+                    Number(xyz[2]).toFixed(1) + ') mm';
+                li.appendChild(xyzSpan);
+                featuresList.appendChild(li);
+
+                // Reset per-card state for the next click
+                state.pendingPixel = null;
+                labelInput.value = '';
+                addBtn.disabled = true;
+
+                statusEl.className = 'phase-2d-status success';
+                statusEl.textContent = 'Feature added. Click again to add another.';
+
+                // Refresh autocomplete pools across all cards (the new label
+                // should be suggestable on other photos too). Cheapest path:
+                // walk all datalist elements and repopulate.
+                var allDatalists = document.querySelectorAll('#phase-2d-photos datalist');
+                allDatalists.forEach(function (dl) { repopulateLabelDatalist(dl); });
+
+                // Enable Next button (at least one feature exists)
+                var nextBtn = document.getElementById('phase-2d-next');
+                if (nextBtn) nextBtn.disabled = false;
+            })
+            .catch(function (err) {
+                statusEl.className = 'phase-2d-status error';
+                statusEl.textContent = 'Network error: ' + err.message;
+                addBtn.disabled = false;
             });
     }
 

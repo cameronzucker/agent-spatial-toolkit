@@ -4,6 +4,17 @@
 # Called by watchdog with one arg: task_id. Acquires the session lock,
 # leases the task, creates the branch, installs the pre-commit hook,
 # starts a heartbeat, and execs `claude -p`. On return, calls session_exit.
+#
+# Environment:
+#   AUTO_CLAUDE_CLAUDE_BIN  — override the `claude` binary path (defaults
+#                             to "claude" on PATH). Used by the smoke
+#                             test fixture to swap in tests/smoke/mock_claude.sh.
+#   AUTO_CLAUDE_MOCK_CLAUDE — when "1", skip the claude invocation entirely
+#                             and synthesize a successful return. Used by
+#                             unit tests; the smoke suite uses
+#                             AUTO_CLAUDE_CLAUDE_BIN instead so the actual
+#                             argv contract is exercised.
+#   AUTO_CLAUDE_SESSION_ID  — pre-set the session id (otherwise auto-generated).
 
 set -euo pipefail
 

@@ -484,3 +484,45 @@ the agent before it touches it. Don't rely on humans to remember.
   the orchestrator (the watchdog) and the operator (the human).
 - **Sibling worktree**. Another `git worktree add`-created checkout of
   this repo. Detected via `git worktree list --porcelain`.
+
+## 13. End-to-end validation
+
+The unit suite at `tests/test_auto_claude.bats` covers individual
+functions in isolation — lock acquisition, state mutation, safe-git
+refusals, sibling-worktree detection, and so on. That suite catches
+regressions in any one component but cannot answer the question "does
+the whole pipeline fit together?"
+
+`tests/smoke/test_smoke_e2e.bats` answers that question. Each test:
+
+1. Stands up an isolated test repo (`mktemp -d`) with a local bare-repo
+   upstream. No GitHub calls, no real Anthropic API calls.
+2. Mirrors the real `scripts/auto_claude/` into the sandbox and runs
+   `install.sh --no-deps`.
+3. Seeds one task into `state.json`, then invokes the real
+   `watchdog.sh`, which spawns the real `session_boot.sh`, which
+   exec's a stub `claude` (see `tests/smoke/mock_claude.sh`), which
+   uses the real `safe-git` and the real pre-commit hook, then exits
+   through the real `session_exit.sh`.
+4. Asserts on the on-disk side-effects: state transitions, event
+   sequence, lock cleanup, branch push to upstream, reflog snapshot,
+   tests-passed marker consumption.
+
+The five scenarios are:
+
+| Scenario | What it proves |
+| -------- | -------------- |
+| Happy-path full cycle | `pending → leased → ... → pr_open` end-to-end |
+| Empty backlog | watchdog returns `quiescent` and emits no spawn |
+| Stale lock cleanup | watchdog clears an aged-out lock then proceeds |
+| Concurrent watchdogs | `flock` serializes; only one progresses |
+| Rate limit | 7 fabricated spawn_results trip the rolling-hour limiter |
+
+`session_boot.sh` accepts `AUTO_CLAUDE_CLAUDE_BIN` to override the
+`claude` binary path; the smoke fixture sets it to `mock_claude.sh`.
+`gh` is shadowed onto `PATH` via `mock_gh.sh`. Both are documented in
+[`tests/smoke/README.md`](../tests/smoke/README.md), which also
+explains why this validation does not exercise the real Claude or real
+GitHub paths (those need API keys, are non-trivial to make
+deterministic, and belong in a separate operator-run real-claude
+runbook).

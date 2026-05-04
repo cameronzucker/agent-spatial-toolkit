@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import cv2
@@ -20,12 +21,35 @@ def render_overlay(
     marker_radius_px: int = 12,
     marker_color: tuple[int, int, int] = (255, 80, 200),  # BGR magenta
     label_color: tuple[int, int, int] = (255, 255, 255),
-) -> None:
+) -> Path:
     """Project features onto photo as colored circles + labels; save as PNG.
 
     Used by spec §3 Phase 2e — the user sees their photos with predicted
     feature positions and confirms or corrects.
     """
+    # Finite-input contract: see spec §5.2 — never silently produce garbage.
+    # Non-finite pose/intrinsics/feature xyz would project to NaN pixels that
+    # silently fail the bounds check and drop features without surfacing the
+    # bad input. Validate up-front, before any I/O.
+    if not (np.isfinite(pose.rvec).all() and np.isfinite(pose.tvec).all()):
+        raise ValueError("render_overlay: pose.rvec and pose.tvec must be finite")
+    if not (
+        math.isfinite(intrinsics.fx_px)
+        and math.isfinite(intrinsics.fy_px)
+        and math.isfinite(intrinsics.cx)
+        and math.isfinite(intrinsics.cy)
+        and np.isfinite(intrinsics.distortion).all()
+    ):
+        raise ValueError("render_overlay: intrinsics must be finite")
+    if intrinsics.fx_px <= 0 or intrinsics.fy_px <= 0:
+        raise ValueError(
+            f"render_overlay: intrinsics fx_px and fy_px must be positive; "
+            f"got fx_px={intrinsics.fx_px}, fy_px={intrinsics.fy_px}"
+        )
+    for label, xyz in features:
+        if not np.isfinite(xyz).all():
+            raise ValueError(f"render_overlay: feature '{label}' has non-finite coordinates: {xyz}")
+
     img = cv2.imread(str(photo_path))
     if img is None:
         raise FileNotFoundError(f"Cannot open image: {photo_path}")
@@ -64,4 +88,14 @@ def render_overlay(
             cv2.LINE_AA,
         )
 
-    cv2.imwrite(str(out_path), img)
+    # Atomic write: same dir for atomic POSIX rename. Matches the pattern
+    # PR #17 established for annotations.json (pipeline/emit.py).
+    # Tmp name preserves the original suffix at the end (e.g. overlay.tmp.png)
+    # because cv2.imwrite picks the encoder from the trailing extension and
+    # would reject a name like overlay.png.tmp.
+    tmp_path = out_path.with_suffix(".tmp" + out_path.suffix)
+    ok = cv2.imwrite(str(tmp_path), img)
+    if not ok:
+        raise OSError(f"cv2.imwrite returned False; could not write {tmp_path}")
+    tmp_path.replace(out_path)
+    return out_path

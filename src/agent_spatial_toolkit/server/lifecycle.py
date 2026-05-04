@@ -22,12 +22,14 @@ _IDLE_POLL_INTERVAL_SECONDS: float = 1.0
 class Server:
     """A running wizard HTTP server bound to a session.
 
-    Attributes prefixed with ``_`` are mutable single-element boxes shared
-    between the request thread, the idle-watcher thread, and the caller. They
-    are intentionally lists (not plain attributes) so that all threads observe
-    the same object without needing a lock for these scalar reads/writes —
-    Python guarantees atomicity for single-element list assignment under the
-    GIL, which is sufficient here.
+    Threading model:
+    - serve_thread runs the WSGIServer in a daemon thread.
+    - _idle_timer (daemon) polls last_activity vs the idle timeout.
+    - _last_activity is a single-element list-box updated atomically by the
+      activity middleware; reads under the GIL are torn-free for scalar
+      writes/reads.
+    - shutdown() is concurrency-safe via _shutdown_lock + _shutdown_done event.
+      Concurrent callers all wait until shutdown completes.
     """
 
     session: Session
@@ -35,8 +37,11 @@ class Server:
     serve_thread: threading.Thread
     _idle_timer: threading.Thread
     _last_activity: list[float]
-    _shutdown_called: list[bool]
+    _shutdown_started: list[bool]
+    _shutdown_lock: threading.Lock
+    _shutdown_done: threading.Event
     idle_timeout_seconds: float
+    time_source: Callable[[], float]
 
     @property
     def port(self) -> int:
@@ -46,31 +51,56 @@ class Server:
     @property
     def url(self) -> str:
         """The base URL clients should connect to."""
-        return f"http://localhost:{self.port}/"
+        return f"http://localhost:{self.port}"
+
+    @property
+    def is_shutdown(self) -> bool:
+        """True after shutdown() has fully completed."""
+        return self._shutdown_done.is_set()
+
+    @property
+    def last_activity(self) -> float:
+        """Timestamp (per time_source) of most recent activity."""
+        return self._last_activity[0]
 
     def mark_activity(self) -> None:
         """Reset the idle-timeout clock.
 
-        Called by the activity-tracking middleware on every request. Exposed
-        publicly so future code (e.g. background workers) can also defer the
-        idle shutdown if needed.
+        Called publicly so future code (e.g. background workers) can defer the
+        idle shutdown if needed. Routes through ``time_source`` for test
+        reproducibility — the activity middleware updates the box directly via
+        the captured ``time_source`` instead, because ``server`` is not yet
+        bound when the closure is created.
         """
-        self._last_activity[0] = time.monotonic()
+        self._last_activity[0] = self.time_source()
 
     def shutdown(self) -> None:
-        """Stop the server and join its threads. Idempotent."""
-        if self._shutdown_called[0]:
-            return
-        self._shutdown_called[0] = True
-        # httpd.shutdown() blocks until serve_forever() returns, so the serve
-        # thread should be done by the time the join is reached. The 5 s
-        # timeout is a safety net; an unbounded join would hang tests on bugs.
-        self.httpd.shutdown()
-        self.httpd.server_close()
-        self.serve_thread.join(timeout=5.0)
-        # The idle-watcher thread polls _shutdown_called[0] and exits on its
-        # own; we deliberately do NOT join it here to avoid waiting up to one
-        # poll-interval on every shutdown.
+        """Stop the server. Idempotent: concurrent callers all wait for completion."""
+        do_shutdown = False
+        with self._shutdown_lock:
+            if self._shutdown_done.is_set():
+                return  # already done
+            if not self._shutdown_started[0]:
+                self._shutdown_started[0] = True
+                do_shutdown = True
+        if do_shutdown:
+            try:
+                # httpd.shutdown() blocks until serve_forever() returns, so the
+                # serve thread should be done by the time the join is reached.
+                # The 5 s timeout is a safety net; an unbounded join would hang
+                # tests on bugs.
+                self.httpd.shutdown()
+                self.httpd.server_close()
+                self.serve_thread.join(timeout=5.0)
+            finally:
+                self._shutdown_done.set()
+            # The idle-watcher thread polls _shutdown_started[0] and exits on
+            # its own; we deliberately do NOT join it here to avoid waiting up
+            # to one poll-interval on every shutdown.
+        else:
+            # Another thread is performing shutdown; wait for it to complete so
+            # every caller observes a fully-stopped server before returning.
+            self._shutdown_done.wait(timeout=10.0)
 
 
 def start_server(
@@ -110,9 +140,14 @@ def start_server(
         ``time.monotonic``; tests inject a controllable callable.
     """
     last_activity: list[float] = [time_source()]
-    shutdown_called: list[bool] = [False]
+    shutdown_started: list[bool] = [False]
+    shutdown_lock = threading.Lock()
+    shutdown_done = threading.Event()
 
     def activity_middleware(environ, start_response):
+        # Update directly via the captured time_source (server isn't bound yet
+        # when this closure is created). External callers should prefer
+        # server.mark_activity() which routes through Server.time_source.
         last_activity[0] = time_source()
         return wsgi_app(environ, start_response)
 
@@ -132,10 +167,19 @@ def start_server(
     server: Server
 
     def _idle_watcher() -> None:
-        while not shutdown_called[0]:
+        while not shutdown_started[0]:
             elapsed = time_source() - last_activity[0]
-            if elapsed > idle_timeout_seconds:
-                if not shutdown_called[0]:
+            # Recheck under-the-wire: a request may have arrived between the
+            # first read above and now. The `and` short-circuits, re-reading
+            # time_source() / last_activity[0] only when the cheap initial
+            # check trips. Not perfectly atomic — the activity update could
+            # STILL land between the recheck and the shutdown call — but
+            # reduces the race window from ~1s to microseconds.
+            if (
+                elapsed > idle_timeout_seconds
+                and time_source() - last_activity[0] > idle_timeout_seconds
+            ):
+                if not shutdown_started[0]:
                     server.shutdown()
                 return
             time.sleep(_IDLE_POLL_INTERVAL_SECONDS)
@@ -152,8 +196,11 @@ def start_server(
         serve_thread=serve_thread,
         _idle_timer=idle_timer,
         _last_activity=last_activity,
-        _shutdown_called=shutdown_called,
+        _shutdown_started=shutdown_started,
+        _shutdown_lock=shutdown_lock,
+        _shutdown_done=shutdown_done,
         idle_timeout_seconds=idle_timeout_seconds,
+        time_source=time_source,
     )
     idle_timer.start()
     return server

@@ -21,7 +21,7 @@ def test_start_server_returns_running_server(tmp_path: Path) -> None:
     try:
         assert isinstance(server, Server)
         assert server.port > 0
-        assert server.url == f"http://localhost:{server.port}/"
+        assert server.url == f"http://localhost:{server.port}"
         # Real HTTP request to verify the server is actually serving.
         with urllib.request.urlopen(server.url, timeout=2.0) as r:
             assert r.read() == b"hello"
@@ -51,16 +51,16 @@ def test_idle_timer_shuts_down_after_timeout(tmp_path: Path) -> None:
         time_source=lambda: fake_now[0],
     )
     try:
-        assert not server._shutdown_called[0]
+        assert not server.is_shutdown
         # Advance fake time past the idle timeout.
         fake_now[0] = 11.0
         # Wait for the idle_watcher's poll loop (1s cadence) to notice.
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
-            if server._shutdown_called[0]:
+            if server.is_shutdown:
                 break
             time.sleep(0.1)
-        assert server._shutdown_called[0]
+        assert server.is_shutdown
     finally:
         server.shutdown()
 
@@ -78,14 +78,14 @@ def test_request_resets_idle_clock(tmp_path: Path) -> None:
         time_source=lambda: fake_now[0],
     )
     try:
-        initial = server._last_activity[0]
+        initial = server.last_activity
         # Advance fake time to 50 (still well within the 100s timeout).
         fake_now[0] = 50.0
         # Make a request — middleware should call time_source() and update last_activity.
         with urllib.request.urlopen(server.url, timeout=2.0) as r:
             r.read()
         # last_activity should now reflect the post-request fake time.
-        assert server._last_activity[0] >= 50.0
-        assert server._last_activity[0] > initial
+        assert server.last_activity >= 50.0
+        assert server.last_activity > initial
     finally:
         server.shutdown()

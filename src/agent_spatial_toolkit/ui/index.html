@@ -67,10 +67,16 @@
             <p id="phase-2b-error" class="error" hidden></p>
         </section>
 
-        <!-- Spec §3 Phase 2c — per-photo anchors (wired in 1.D.5). -->
+        <!-- Spec §3 Phase 2c — per-photo anchors. Wired by app.js wirePhase2c
+             (Task 1.D.5 PR-α). One #phase-2c-photo card per photo is appended
+             at runtime; each carries a canvas + anchor checklist + result area.
+             PR-β layers in a wireframe overlay <img> + retry buttons. -->
         <section id="phase-2c" class="phase" hidden>
             <h2>Phase 2c — Per-photo anchors</h2>
-            <p class="placeholder">Anchor click capture + /api/anchors POST wires up in Task 1.D.5.</p>
+            <p>Click each declared anchor's pixel position in each photo. Minimum 3 anchors per photo to solve pose; the system computes the camera position and reports reprojection RMS so you can verify accuracy.</p>
+            <div id="phase-2c-photos" class="phase-2c-photo-grid"></div>
+            <button id="phase-2c-next" type="button" disabled>Next: feature labeling →</button>
+            <p id="phase-2c-error" class="error" hidden></p>
         </section>
 
         <!-- Spec §3 Phase 2d — feature labeling (wired in 1.D.6). -->

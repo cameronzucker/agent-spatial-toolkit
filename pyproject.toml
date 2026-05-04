@@ -28,3 +28,22 @@ packages = ["src/agent_spatial_toolkit"]
 [tool.hatch.build.targets.wheel.force-include]
 "src/agent_spatial_toolkit/calibration/chessboard_a4.pdf" = "agent_spatial_toolkit/calibration/chessboard_a4.pdf"
 "src/agent_spatial_toolkit/calibration/chessboard_letter.pdf" = "agent_spatial_toolkit/calibration/chessboard_letter.pdf"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]  # line length handled by formatter

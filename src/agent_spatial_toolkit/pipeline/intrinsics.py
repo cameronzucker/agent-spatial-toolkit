@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
-
 from PIL import ExifTags, Image
 
 # EXIF tag name → tag ID lookup (built once from PIL)

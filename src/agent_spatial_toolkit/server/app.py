@@ -55,6 +55,7 @@ from agent_spatial_toolkit.schema.models import (
 )
 from agent_spatial_toolkit.schema.validators import ValidationError
 from agent_spatial_toolkit.server.events import EventLog
+from agent_spatial_toolkit.server.lens_catalog import list_lens_entries
 from agent_spatial_toolkit.server.session import Session
 
 
@@ -321,6 +322,16 @@ def _register_routes(app: Flask) -> None:
         session: Session = app.config["SESSION"]
         mem: dict[str, Any] = app.config["STATE"]
         return jsonify(_state_snapshot(session, mem))
+
+    @app.get("/api/lens_catalog")
+    def get_lens_catalog() -> Any:
+        """Return the canonical lens catalog (id + label + resolvability).
+
+        Intrinsics data is NOT exposed — clients only need to populate the
+        Phase 2a dropdown and decide whether resolution requires extra input
+        (EXIF dict, full intrinsics dict).
+        """
+        return jsonify({"lenses": list_lens_entries()})
 
     @app.post("/api/anchors")
     def post_anchors() -> Any:

@@ -493,3 +493,34 @@ def test_anchors_pose_failure_logs_to_events_with_safe_message(app_factory) -> N
     # Full detail in events.jsonl
     events_text = (session.session_dir / "events.jsonl").read_text()
     assert "pose_failed" in events_text
+
+
+def test_lens_catalog_route_returns_expected_lens_ids(app_factory) -> None:
+    """GET /api/lens_catalog returns the v0 catalog entries."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    resp = client.get("/api/lens_catalog")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert "lenses" in body
+    ids = {entry["id"] for entry in body["lenses"]}
+    assert "pi_camera_module_3_standard" in ids
+    assert "exif:detected" in ids
+    assert "other" in ids
+
+
+def test_lens_catalog_entries_carry_label_and_resolvable_flag(app_factory) -> None:
+    """Each entry has id, label, resolvable, notes (no intrinsics leakage)."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    body = client.get("/api/lens_catalog").get_json()
+    by_id = {e["id"]: e for e in body["lenses"]}
+    standard = by_id["pi_camera_module_3_standard"]
+    assert standard["label"] == "Pi Camera Module 3 (standard)"
+    assert standard["resolvable"] is True
+    assert "intrinsics" not in standard  # do NOT leak intrinsics into client payload
+    # Ultrawide → resolvable=False
+    assert by_id["pi_camera_module_3_wide"]["resolvable"] is False
+    assert by_id["exif:detected"]["resolvable"] is False

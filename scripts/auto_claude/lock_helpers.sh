@@ -152,36 +152,69 @@ acquire_lock() {
 
 # release_lock <path>
 # Verifies session_id matches AUTO_CLAUDE_SESSION_ID before unlinking.
+# Held under .serial flock so it doesn't race with update_heartbeat.
 release_lock() {
     local path="$1"
+    local serial
+    serial="$(_lock_serial_path "$path")"
+    mkdir -p "$(dirname "$serial")"
+    (
+        flock -x 9
+        [[ -f "$path" ]] || exit 0
 
-    [[ -f "$path" ]] || return 0
+        local owner
+        owner=$(jq -r '.session_id // empty' "$path" 2>/dev/null) || exit 5
+        if [[ "$owner" != "${AUTO_CLAUDE_SESSION_ID:-}" ]]; then
+            echo "release_lock: refusing to release lock owned by '$owner' (we are '${AUTO_CLAUDE_SESSION_ID:-}')" >&2
+            exit 6
+        fi
+        rm -f "$path"
+    ) 9>"$serial"
+}
 
-    local owner
-    owner=$(jq -r '.session_id // empty' "$path" 2>/dev/null) || return 5
-    if [[ "$owner" != "${AUTO_CLAUDE_SESSION_ID:-}" ]]; then
-        echo "release_lock: refusing to release lock owned by '$owner' (we are '${AUTO_CLAUDE_SESSION_ID:-}')" >&2
-        return 6
-    fi
-    rm -f "$path"
+# Path of the cross-process serial lock guarding lock-file mutations
+# (update_heartbeat, release_lock cleanup races, etc.). Sibling lock to the
+# session lock itself; held only briefly during read-check-write.
+_lock_serial_path() {
+    local session_lock="$1"
+    printf '%s\n' "${session_lock}.serial"
 }
 
 # update_heartbeat <path>
 # Atomically refresh heartbeat_at on a lock we own.
+#
+# M4: read-check-write must be serialized. Without flock, the watchdog can
+# `rm` the lock between our owner-check and our `mv`, and the `mv`
+# resurrects a deleted lock with our session metadata — a successor that
+# thought the slot was free now sees a "fresh" lock that isn't theirs.
+# Serialize on a sibling .serial lock; both update_heartbeat and release_lock
+# acquire it before touching the lock file.
 update_heartbeat() {
     local path="$1"
-    [[ -f "$path" ]] || return 1
+    local serial
+    serial="$(_lock_serial_path "$path")"
+    mkdir -p "$(dirname "$serial")"
+    (
+        flock -x 9
+        [[ -f "$path" ]] || exit 1
 
-    local owner
-    owner=$(jq -r '.session_id // empty' "$path" 2>/dev/null) || return 5
-    if [[ "$owner" != "${AUTO_CLAUDE_SESSION_ID:-}" ]]; then
-        echo "update_heartbeat: lock owned by '$owner', not us ('${AUTO_CLAUDE_SESSION_ID:-}')" >&2
-        return 6
-    fi
+        local owner
+        owner=$(jq -r '.session_id // empty' "$path" 2>/dev/null) || exit 5
+        if [[ "$owner" != "${AUTO_CLAUDE_SESSION_ID:-}" ]]; then
+            echo "update_heartbeat: lock owned by '$owner', not us ('${AUTO_CLAUDE_SESSION_ID:-}')" >&2
+            exit 6
+        fi
 
-    local now tmp
-    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    tmp="$(mktemp "${path}.tmp.XXXXXX")"
-    jq --arg hb "$now" '.heartbeat_at = $hb' "$path" > "$tmp"
-    mv "$tmp" "$path"
+        local now tmp
+        now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        tmp="$(mktemp "${path}.tmp.XXXXXX")"
+        jq --arg hb "$now" '.heartbeat_at = $hb' "$path" > "$tmp"
+        # If the lock file disappeared while we were composing the new content
+        # (e.g. release_lock between our check and now), don't resurrect it.
+        if [[ ! -f "$path" ]]; then
+            rm -f "$tmp"
+            exit 7
+        fi
+        mv "$tmp" "$path"
+    ) 9>"$serial"
 }

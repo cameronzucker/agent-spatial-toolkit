@@ -107,6 +107,45 @@ teardown() {
     rm -f "$LOCK"
 }
 
+@test "update_heartbeat does not resurrect a deleted lock (M4)" {
+    # M4: between the owner-check and the mv, an external actor (the watchdog
+    # cleaning a stale lock) can rm the file. With the previous read-check-mv
+    # implementation, the mv would silently resurrect the lock. With the
+    # serial flock + post-compose existence check, the resurrection is blocked.
+    #
+    # We can't easily inject a mid-flight rm under a flock from inside bats
+    # without actual concurrency; instead, test the cooperative path: rm the
+    # lock first, then call update_heartbeat — it must NOT recreate the lock.
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/lock_helpers.sh"
+    LOCK="$AUTO_CLAUDE_REPO_ROOT/.handoff/.lock"
+    acquire_lock "$LOCK" "TASK-1" "feat/x" "leased"
+    [[ -f "$LOCK" ]]
+    rm -f "$LOCK"
+    run update_heartbeat "$LOCK"
+    [[ "$status" -ne 0 ]]
+    [[ ! -f "$LOCK" ]]
+}
+
+@test "update_heartbeat creates and releases its serial lock (M4)" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/lock_helpers.sh"
+    LOCK="$AUTO_CLAUDE_REPO_ROOT/.handoff/.lock"
+    SERIAL="${LOCK}.serial"
+    acquire_lock "$LOCK" "TASK-1" "feat/x" "leased"
+    update_heartbeat "$LOCK"
+    # Serial-lock file is created (it's a flock target); should exist now.
+    [[ -f "$SERIAL" ]]
+    # Concurrent update_heartbeat calls should serialize without corrupting JSON.
+    for i in 1 2 3 4 5; do
+        update_heartbeat "$LOCK" &
+    done
+    wait
+    # After all calls, the lock is still valid JSON with our session_id.
+    run jq -r '.session_id' "$LOCK"
+    [[ "$output" == "$AUTO_CLAUDE_SESSION_ID" ]]
+    release_lock "$LOCK"
+    [[ ! -f "$LOCK" ]]
+}
+
 @test "update_heartbeat refuses cross-session writes" {
     source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/lock_helpers.sh"
     LOCK="$AUTO_CLAUDE_REPO_ROOT/.handoff/.lock"

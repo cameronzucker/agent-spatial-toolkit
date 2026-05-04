@@ -560,7 +560,10 @@ JSON
 
 # ---- pre-commit hook ---------------------------------------------------
 
-@test "pre-commit hook allows when no lease" {
+@test "pre-commit hook allows when no lease (human mode, session env unset)" {
+    # M1: out-of-session (AUTO_CLAUDE_SESSION_ID unset) is friendly — a human
+    # committing manually with state.json present but no active lease should
+    # be allowed. In-session that path fails closed; see the M1 test below.
     source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
     state_init
     cp "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/hooks/pre-commit" "$AUTO_CLAUDE_REPO_ROOT/.git/hooks/pre-commit"
@@ -568,7 +571,7 @@ JSON
     cd "$AUTO_CLAUDE_REPO_ROOT"
     echo "y" > foo
     git add foo
-    run git commit -m "test no lease"
+    run env -u AUTO_CLAUDE_SESSION_ID git commit -m "test no lease"
     [[ "$status" -eq 0 ]]
 }
 
@@ -597,6 +600,44 @@ JSON
     run git commit -m "should fail"
     [[ "$status" -ne 0 ]]
     [[ "$output" == *"REFUSING"* || "$output" == *"branch mismatch"* ]]
+}
+
+@test "pre-commit fails closed when AUTO_CLAUDE_SESSION_ID is set and state.json is missing (M1)" {
+    cp "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/hooks/pre-commit" "$AUTO_CLAUDE_REPO_ROOT/.git/hooks/pre-commit"
+    chmod +x "$AUTO_CLAUDE_REPO_ROOT/.git/hooks/pre-commit"
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    rm -f "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json"
+    echo "y" > foo
+    git add foo
+    AUTO_CLAUDE_SESSION_ID="sess-test" run git commit -m "should fail"
+    [[ "$status" -ne 0 ]]
+    [[ "$output" == *"state.json missing"* ]]
+}
+
+@test "pre-commit fails closed when AUTO_CLAUDE_SESSION_ID is set and lease is null (M1)" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    state_init
+    cp "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/hooks/pre-commit" "$AUTO_CLAUDE_REPO_ROOT/.git/hooks/pre-commit"
+    chmod +x "$AUTO_CLAUDE_REPO_ROOT/.git/hooks/pre-commit"
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    echo "y" > foo
+    git add foo
+    AUTO_CLAUDE_SESSION_ID="sess-test" run git commit -m "should fail"
+    [[ "$status" -ne 0 ]]
+    [[ "$output" == *"no current_lease"* || "$output" == *"refusing commit"* ]]
+}
+
+@test "pre-commit allows when AUTO_CLAUDE_SESSION_ID is unset and state.json is missing (M1 fallback)" {
+    cp "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/hooks/pre-commit" "$AUTO_CLAUDE_REPO_ROOT/.git/hooks/pre-commit"
+    chmod +x "$AUTO_CLAUDE_REPO_ROOT/.git/hooks/pre-commit"
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    rm -f "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json"
+    echo "y" > foo
+    git add foo
+    # Explicitly unset, in case bats env carries it over from elsewhere.
+    unset AUTO_CLAUDE_SESSION_ID
+    run env -u AUTO_CLAUDE_SESSION_ID git commit -m "ok"
+    [[ "$status" -eq 0 ]]
 }
 
 @test "pre-commit hook allows when branch matches lease" {

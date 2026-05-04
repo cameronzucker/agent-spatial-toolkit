@@ -37,15 +37,20 @@
 (function () {
     'use strict';
 
-    function captureClick(canvas, callback) {
-        canvas.addEventListener('click', function (e) {
-            var rect = canvas.getBoundingClientRect();
+    function captureClick(canvasElement, callback) {
+        canvasElement.addEventListener('click', function (e) {
+            var rect = canvasElement.getBoundingClientRect();
+            // Skip when the canvas isn't laid out (display:none or
+            // not-yet-attached). Without this guard, dividing by zero
+            // produces NaN/Infinity coords that show up as "click did
+            // nothing" debugging noise downstream.
+            if (rect.width <= 0 || rect.height <= 0) return;
             // Scale CSS coords to canvas natural pixel coords. Required for
             // any canvas where width/height attribute differ from CSS box —
             // e.g., a 4032×3024 photo displayed at 800×600 still needs
             // clicks reported in the original pixel space.
-            var x = (e.clientX - rect.left) * (canvas.width / rect.width);
-            var y = (e.clientY - rect.top) * (canvas.height / rect.height);
+            var x = (e.clientX - rect.left) * (canvasElement.width / rect.width);
+            var y = (e.clientY - rect.top) * (canvasElement.height / rect.height);
             callback({ x: x, y: y });
         });
     }
@@ -89,22 +94,36 @@
         var offset = 2;
         while (offset + 4 < view.byteLength) {
             var marker = view.getUint16(offset);
-            if (marker === 0xFFE1) {
+            // APP1 carries either EXIF or XMP. iPhones (since iOS 11) and
+            // recent Android devices commonly write APP1/XMP BEFORE APP1/Exif,
+            // so a return-on-first-APP1 short-circuit would silently skip
+            // valid EXIF on those files. Verify the "Exif\0\0" identifier
+            // and fall through to the segment-skip path if absent.
+            if (marker === 0xFFE1 && offset + 10 < view.byteLength) {
                 var exifId = String.fromCharCode(
                     view.getUint8(offset + 4),
                     view.getUint8(offset + 5),
                     view.getUint8(offset + 6),
                     view.getUint8(offset + 7)
                 );
-                if (exifId !== 'Exif') return null;
-                var tiffStart = offset + 10;
-                var byteOrder = view.getUint16(tiffStart);
-                var le = (byteOrder === 0x4949);
-                var ifd0Offset = view.getUint32(tiffStart + 4, le);
-                return readIfd(view, tiffStart, ifd0Offset, le);
+                if (exifId === 'Exif') {
+                    var tiffStart = offset + 10;
+                    // Need at least 8 bytes for the TIFF header (byte order
+                    // + magic + IFD0 offset). Without this guard a truncated
+                    // EXIF segment near the slice boundary would throw a
+                    // RangeError that the caller-side try/catch swallows
+                    // as "no EXIF" rather than the more accurate "EXIF
+                    // present but malformed".
+                    if (tiffStart + 8 > view.byteLength) return null;
+                    var byteOrder = view.getUint16(tiffStart);
+                    var le = (byteOrder === 0x4949);
+                    var ifd0Offset = view.getUint32(tiffStart + 4, le);
+                    return readIfd(view, tiffStart, ifd0Offset, le);
+                }
+                // APP1 but not EXIF — fall through to segment-skip below.
             }
-            // Skip non-APP1 segment. Segment length includes the 2 length
-            // bytes themselves but not the marker bytes.
+            // Skip non-APP1 (or non-EXIF APP1) segment. Segment length
+            // includes the 2 length bytes themselves but not the marker.
             var segLen = view.getUint16(offset + 2);
             offset += 2 + segLen;
         }
@@ -186,7 +205,11 @@
         zone.addEventListener('drop', function (e) {
             e.preventDefault();
             zone.classList.remove('dragover');
-            var files = Array.from(e.dataTransfer.files);
+            // Real `drop` events always have dataTransfer per HTML spec, but
+            // synthetic events from tooling and some embedded contexts can
+            // omit it. Guard so the helper degrades to onFiles([]) instead
+            // of throwing.
+            var files = e.dataTransfer ? Array.from(e.dataTransfer.files || []) : [];
             onFiles(files);
         });
     }

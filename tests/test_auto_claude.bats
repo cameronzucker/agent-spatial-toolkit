@@ -1003,6 +1003,101 @@ JSON
 
 # ---- session_boot end-to-end with mock claude --------------------------
 
+@test "session_exit reclassifies pending and audits when gh fails (NM2)" {
+    # NM2: when gh is unavailable or returns nonzero, we MUST NOT default to
+    # pr_open just because no PR was returned. Pre-fix, missing-gh meant the
+    # gate was silently skipped and a pushed branch + marker file got
+    # pr_open. Now the gate requires a positive successful gh check.
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"pending","branch":"feat/t","attempts":0,"depends_on":[]}
+  ],
+  "current_lease": null
+}
+JSON
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    state_acquire_lease "TASK-1" "sess-A" "feat/t" "$(git rev-parse HEAD)"
+    git checkout -q -b feat/t
+    echo "x" > work
+    git add work
+    git commit -q -m "feat: work"
+    # Touch the tests-passed marker so that path-of-the-gate is satisfied —
+    # we want to isolate the gh check.
+    touch "$AUTO_CLAUDE_REPO_ROOT/.handoff/tests-passed-TASK-1"
+    # Set up a fake remote tracking ref so branch_not_pushed doesn't fail.
+    git update-ref "refs/remotes/origin/feat/t" HEAD
+
+    # Mock gh to always exit nonzero — simulates auth failure / network etc.
+    mock_bin="$BATS_TEST_TMPDIR/mockbin-gh-fail"
+    mkdir -p "$mock_bin"
+    cat > "$mock_bin/gh" <<'SH'
+#!/usr/bin/env bash
+echo "gh: not authenticated" >&2
+exit 1
+SH
+    chmod +x "$mock_bin/gh"
+
+    PATH="$mock_bin:$PATH" AUTO_CLAUDE_SESSION_ID="sess-A" \
+        run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/session_exit.sh" \
+        TASK-1 sess-A 0
+    [[ "$status" -eq 0 ]]
+    # Critical: NOT pr_open. Should be pending (attempts<max).
+    final=$(jq -r '.tasks[0].status' "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json")
+    [[ "$final" == "pending" ]]
+    # And the alert was audited.
+    run grep -c '"type":"alert_gh_unavailable"' "$AUTO_CLAUDE_REPO_ROOT/.handoff/events.jsonl"
+    [[ "$output" -ge 1 ]]
+}
+
+@test "session_exit reclassifies pending when gh is not installed (NM2)" {
+    # NM2: same expectation when gh binary is missing — falls back to pending,
+    # not pr_open.
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"pending","branch":"feat/t","attempts":0,"depends_on":[]}
+  ],
+  "current_lease": null
+}
+JSON
+    cd "$AUTO_CLAUDE_REPO_ROOT"
+    state_acquire_lease "TASK-1" "sess-A" "feat/t" "$(git rev-parse HEAD)"
+    git checkout -q -b feat/t
+    echo "x" > work
+    git add work
+    git commit -q -m "feat: work"
+    touch "$AUTO_CLAUDE_REPO_ROOT/.handoff/tests-passed-TASK-1"
+    git update-ref "refs/remotes/origin/feat/t" HEAD
+
+    # Stage a minimal PATH that includes everything the script uses
+    # (bash, jq, git, date, mktemp, awk, grep, head, sed, rm, mkdir, cp,
+    # hostname, uname, sha256sum) but explicitly EXCLUDES gh. We do this by
+    # symlinking only the needed binaries into a fresh dir and pointing PATH
+    # at it.
+    fakebin="$BATS_TEST_TMPDIR/no-gh-bin"
+    mkdir -p "$fakebin"
+    for tool in bash jq git date mktemp awk grep head sed rm mkdir cp mv hostname uname sha256sum tr cat ls flock kill ps stat readlink dirname basename printf id env touch sort tee uniq cut wc; do
+        if real_path=$(command -v "$tool" 2>/dev/null); then
+            ln -sf "$real_path" "$fakebin/$tool"
+        fi
+    done
+    # Confirm gh is NOT in $fakebin
+    [[ ! -e "$fakebin/gh" ]]
+    PATH="$fakebin" AUTO_CLAUDE_SESSION_ID="sess-A" \
+        run "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/session_exit.sh" \
+        TASK-1 sess-A 0
+    [[ "$status" -eq 0 ]]
+    final=$(jq -r '.tasks[0].status' "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json")
+    [[ "$final" == "pending" ]]
+    run grep -c '"reason":"gh_not_installed"' "$AUTO_CLAUDE_REPO_ROOT/.handoff/events.jsonl"
+    [[ "$output" -ge 1 ]]
+}
+
 @test "session_exit refuses pr_open without tests-passed marker file (M2)" {
     source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
     cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'

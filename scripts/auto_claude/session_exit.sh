@@ -98,17 +98,46 @@ if ! git rev-parse --verify "$remote_ref" >/dev/null 2>&1; then
 fi
 
 # PR exists for the branch?
+#
+# NM2: this gate must require a POSITIVE check that gh queried successfully
+# AND no PR was found. The previous code silently skipped the gate when gh
+# was missing or unauthenticated — so a pushed branch + tests-passed marker
+# would be classified `pr_open` despite no real PR existing. We now treat
+# any failure to consult gh as "PR existence unknown" and force the task
+# back to `pending`, audited as `alert_gh_unavailable`. Never default to
+# `pr_open` without a confirmed PR.
 pr_number=""
 pr_url=""
+gh_checked=0
 if command -v gh >/dev/null 2>&1; then
-    pr_json=$(gh pr list --head "$task_branch" --state open \
-        --json number,url --limit 1 2>/dev/null || echo "[]")
-    pr_number=$(jq -r '.[0].number // empty' <<<"$pr_json")
-    pr_url=$(jq -r '.[0].url // empty' <<<"$pr_json")
-    if [[ -z "$pr_number" ]]; then
+    if pr_json=$(gh pr list --head "$task_branch" --state open \
+            --json number,url --limit 1 2>"$AUTO_CLAUDE_REPO_ROOT/.handoff/.gh-stderr.tmp"); then
+        gh_checked=1
+        pr_number=$(jq -r '.[0].number // empty' <<<"$pr_json")
+        pr_url=$(jq -r '.[0].url // empty' <<<"$pr_json")
+        if [[ -z "$pr_number" ]]; then
+            gate_ok=0
+            gate_failures+=("no_open_pr")
+        fi
+    else
+        gh_err=$(cat "$AUTO_CLAUDE_REPO_ROOT/.handoff/.gh-stderr.tmp" 2>/dev/null || true)
+        audit_event "alert_gh_unavailable" "$(jq -cn --arg branch "$task_branch" --arg err "$gh_err" \
+            '{branch:$branch, reason:"gh_pr_list_failed", err:$err}')"
         gate_ok=0
-        gate_failures+=("no_open_pr")
+        gate_failures+=("gh_unavailable")
     fi
+    rm -f "$AUTO_CLAUDE_REPO_ROOT/.handoff/.gh-stderr.tmp"
+else
+    audit_event "alert_gh_unavailable" "$(jq -cn --arg branch "$task_branch" \
+        '{branch:$branch, reason:"gh_not_installed"}')"
+    gate_ok=0
+    gate_failures+=("gh_unavailable")
+fi
+# Forbid pr_open when we couldn't actually verify the PR exists. Even if
+# every other gate passed, the absence of a positive check means we don't
+# know — and the safe default is "retry" not "claim success."
+if (( gh_checked == 0 )); then
+    gate_ok=0
 fi
 
 # Tests-passed marker: a per-task file the implementer must touch as part

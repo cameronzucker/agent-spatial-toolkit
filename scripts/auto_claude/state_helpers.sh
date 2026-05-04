@@ -215,6 +215,29 @@ state_validate() {
         return 4
     fi
 
+    # 4. (NM3) every task.id and task.branch must pass the same validators
+    #    that state_acquire_lease applies. Previously these were checked only
+    #    at lease-acquire time, so a malformed branch could sit in state.json
+    #    and pass schema validation, then fail late in git with an alert at
+    #    the wrong layer. Validate eagerly.
+    local task_ids task_branches id branch
+    task_ids=$(jq -r '.tasks[].id' "$path")
+    task_branches=$(jq -r '.tasks[].branch' "$path")
+    while IFS= read -r id; do
+        [[ -z "$id" ]] && continue
+        if ! _validate_task_id "$id"; then
+            echo "state_validate: task id failed validation: $id" >&2
+            return 5
+        fi
+    done <<<"$task_ids"
+    while IFS= read -r branch; do
+        [[ -z "$branch" ]] && continue
+        if ! _validate_branch "$branch"; then
+            echo "state_validate: task branch failed validation: $branch" >&2
+            return 6
+        fi
+    done <<<"$task_branches"
+
     return 0
 }
 

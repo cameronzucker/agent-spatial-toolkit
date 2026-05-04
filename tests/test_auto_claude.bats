@@ -236,6 +236,57 @@ JSON
     [[ "$status" -eq 0 ]]
 }
 
+@test "state_validate rejects malformed task branch (NM3)" {
+    # NM3: previously _validate_branch was only called at lease-acquire time,
+    # so a state.json with `--orphan` as a task branch would pass schema
+    # validation and only fail late in git. state_validate must now apply
+    # the same validators eagerly.
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"pending","branch":"--orphan","attempts":0,"depends_on":[]}
+  ],
+  "current_lease": null
+}
+JSON
+    run state_validate
+    [[ "$status" -ne 0 ]]
+    [[ "$output" == *"branch"* || "$output" == *"--orphan"* ]]
+}
+
+@test "state_validate rejects malformed task id (NM3)" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    # Lowercase id violates _validate_task_id (^[A-Z]...).
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"task-1","title":"t","status":"pending","branch":"feat/t","attempts":0,"depends_on":[]}
+  ],
+  "current_lease": null
+}
+JSON
+    run state_validate
+    [[ "$status" -ne 0 ]]
+}
+
+@test "state_validate rejects task branch with embedded dotdot (NM3)" {
+    source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
+    cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'
+{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-1","title":"t","status":"pending","branch":"feat/..hack","attempts":0,"depends_on":[]}
+  ],
+  "current_lease": null
+}
+JSON
+    run state_validate
+    [[ "$status" -ne 0 ]]
+}
+
 @test "state_acquire_lease + state_release_lease roundtrip" {
     source "$AUTO_CLAUDE_REPO_ROOT/scripts/auto_claude/state_helpers.sh"
     cat > "$AUTO_CLAUDE_REPO_ROOT/.handoff/state.json" <<'JSON'

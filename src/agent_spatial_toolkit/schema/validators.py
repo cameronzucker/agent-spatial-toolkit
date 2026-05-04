@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 
 class ValidationError(ValueError):
     """Raised when a value does not satisfy the schema's closed contracts."""
@@ -20,10 +22,16 @@ QUALITY_FLAGS: dict[str, bool] = {
 
 def validate_quality_flag(flag: str) -> None:
     """Validate a single flag string against the closed enum."""
-    if ":" in flag:
-        prefix, _, suffix = flag.partition(":")
+    has_id = ":" in flag
+    if has_id:
+        prefix, suffix = flag.split(":", maxsplit=1)
         if not suffix:
             raise ValidationError(f"Flag '{flag}' has empty :<id> suffix")
+        if ":" in suffix:
+            raise ValidationError(
+                f"Flag '{flag}' has multi-colon suffix '{suffix}'; "
+                "spec §6 grammar is 'prefix:<id>' with a single id token"
+            )
     else:
         prefix = flag
 
@@ -33,21 +41,25 @@ def validate_quality_flag(flag: str) -> None:
         )
 
     needs_id = QUALITY_FLAGS[prefix]
-    has_id = ":" in flag
     if needs_id and not has_id:
         raise ValidationError(f"Flag '{prefix}' requires ':<id>' suffix")
     if not needs_id and has_id:
         raise ValidationError(f"Flag '{prefix}' does not take an :<id> suffix")
 
 
-def validate_annotations(data: dict) -> None:
+def validate_annotations(data: dict[str, Any]) -> None:
     """Top-level validation of an annotations.json dict.
 
-    Currently checks: quality_summary.flags are all valid. More invariants
-    can be added (e.g., feature.visible_in references actual photo IDs;
-    pcb_xyz_mm[2] consistent with z_assumed_mm; etc.) as the implementation
-    matures.
+    v1 scope: validates quality_summary.flags against the closed enum and
+    requires quality_summary to be present (spec §6 makes it a required
+    top-level key). More invariants (visible_in references, pcb_xyz_mm[2]
+    consistency, etc.) can be added as the implementation matures.
+
+    Raises ValidationError if quality_summary is missing or any flag is
+    invalid. Returns None on success.
     """
-    flags = data.get("quality_summary", {}).get("flags", [])
+    if "quality_summary" not in data:
+        raise ValidationError("annotations document is missing required 'quality_summary' key")
+    flags = data["quality_summary"].get("flags", [])
     for flag in flags:
         validate_quality_flag(flag)

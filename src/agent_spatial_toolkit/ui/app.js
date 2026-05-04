@@ -57,11 +57,19 @@
     window.spatialState = window.spatialState || { photos: {} };
 
     function init() {
+        // Wire phase controls FIRST, independent of /api/state. Without this,
+        // a failed state fetch would brick the Next button (no listener
+        // attached) and trap the user in Phase 2a forever.
+        wirePhaseControls();
         fetch('/api/state')
-            .then(function (r) { return r.json(); })
+            .then(function (r) {
+                if (!r.ok) {
+                    throw new Error('GET /api/state returned ' + r.status);
+                }
+                return r.json();
+            })
             .then(function (state) {
                 renderThumbnails(state.photos || []);
-                wirePhaseControls();
             })
             .catch(function (err) {
                 // Surface init failure visibly so a user (or test) sees a
@@ -80,12 +88,15 @@
         photos.forEach(function (photo) {
             var card = buildThumbnailCard(photo);
             container.appendChild(card);
-            // Track per-photo state so phase 2c (1.D.5) can read it.
+            // Merge with any prior selection so a re-render (e.g., after a
+            // drag-drop upload triggers another /api/state fetch) doesn't
+            // silently overwrite user choices.
+            var existing = window.spatialState.photos[photo.id] || {};
             window.spatialState.photos[photo.id] = {
                 url: photo.url,
-                lens: '',
-                viewLabel: '',
-                exif: null,  // populated by populateExif below
+                lens: existing.lens || '',
+                viewLabel: existing.viewLabel || '',
+                exif: existing.exif || null,  // populated by populateExif below
             };
             // Async EXIF parse — does not block thumbnail render.
             populateExif(photo, card);
@@ -164,17 +175,52 @@
         // helper. The helper takes a File; the wrapper bridges from the
         // URL-served photo into the same code path drag-dropped photos use.
         fetch(photo.url)
-            .then(function (r) { return r.blob(); })
+            .then(function (r) {
+                // Reject 4xx/5xx explicitly. Without this, a 404 HTML body
+                // would feed into Blob → FileReader → parseExif → null,
+                // surfacing as "no EXIF" instead of "fetch failed".
+                if (!r.ok) {
+                    throw new Error('photo fetch ' + photo.url + ' returned ' + r.status);
+                }
+                return r.blob();
+            })
             .then(function (blob) {
                 var file = new File([blob], photo.id, { type: blob.type });
                 window.spatialUI.getEXIFFromUploaded(file, function (exif) {
                     window.spatialState.photos[photo.id].exif = exif;
                     exifInfo.textContent = formatExif(exif);
+                    maybeAutoSelectLens(photo, card, exif);
                 });
             })
             .catch(function () {
                 exifInfo.textContent = 'EXIF unavailable (fetch failed)';
             });
+    }
+
+    // When EXIF detects a camera/lens, add a pre-selected "Detected: …"
+    // option to the lens dropdown. Spec §3 line 156 calls for the dropdown
+    // to be "populated from EXIF if detected" — this satisfies that clause
+    // without trying to fuzzy-match arbitrary EXIF lensModel strings against
+    // the placeholder LENS_OPTIONS list. The user can still override by
+    // picking a different option.
+    function maybeAutoSelectLens(photo, card, exif) {
+        if (!exif || (!exif.make && !exif.model && !exif.lensModel)) return;
+        var select = card.querySelector('select.lens-select');
+        if (!select) return;
+        var detectedValue = 'exif:detected';
+        var detectedLabel = 'Detected: ' + formatExif(exif);
+        var option = document.createElement('option');
+        option.value = detectedValue;
+        option.textContent = detectedLabel;
+        // Insert just after the placeholder so the auto-detected option is
+        // visible at the top of the real choices.
+        if (select.firstChild && select.firstChild.nextSibling) {
+            select.insertBefore(option, select.firstChild.nextSibling);
+        } else {
+            select.appendChild(option);
+        }
+        select.value = detectedValue;
+        window.spatialState.photos[photo.id].lens = detectedValue;
     }
 
     function formatExif(exif) {
@@ -196,12 +242,22 @@
         }
         var dropZone = document.getElementById('phase-2a-drop-zone');
         if (dropZone && window.spatialUI) {
-            window.spatialUI.attachDragDrop(dropZone, function (_files) {
-                // Backend upload route lands in a future task; for now the
-                // drop zone exists so the UI surface is real but a no-op
-                // for additional photos. Surface the receipt so users
-                // aren't confused by silent drops.
+            window.spatialUI.attachDragDrop(dropZone, function (files) {
+                // Backend upload route lands in a future task; surface a
+                // visible "not yet wired" message rather than silently
+                // dropping the files (which would feel like a bug to users).
                 dropZone.classList.add('drop-pending');
+                var status = dropZone.querySelector('.drop-status') || (function () {
+                    var s = document.createElement('p');
+                    s.className = 'drop-status';
+                    dropZone.appendChild(s);
+                    return s;
+                })();
+                status.textContent = (
+                    'Received ' + files.length + ' file(s). Mid-wizard upload ' +
+                    'support arrives in a later task — for now, restart the ' +
+                    'CLI with --photos pointing at all your reference photos.'
+                );
             });
         }
     }

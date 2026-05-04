@@ -53,8 +53,41 @@
         { value: 'other', label: 'other' },
     ];
 
+    // Phase 2b frame presets. Spec §3 line 163 describes the canonical
+    // PCB convention as "bottom-left corner with components facing up;
+    // +X along long edge; +Y along short edge toward GPIO header; +Z
+    // away from PCB bottom" — pcb_standard implements that with the
+    // four corners as named anchors. ``custom`` is a sentinel for a
+    // future free-text frame description (spec line 163's "or fill in
+    // free-text alternatives" — the hooks are here but the UI for it
+    // ships in a follow-up).
+    var FRAME_PRESETS = {
+        '': { label: '— Select preset —', anchors: null },
+        'pcb_standard': {
+            label: 'Standard PCB (origin = bottom-left, +X long, +Y short, +Z up)',
+            anchors: function (longMm, shortMm) {
+                return [
+                    { id: 'pcb_corner_origin', xyz: [0, 0, 0] },
+                    { id: 'pcb_corner_x_max', xyz: [longMm, 0, 0] },
+                    { id: 'pcb_corner_y_max', xyz: [0, shortMm, 0] },
+                    { id: 'pcb_corner_xy_max', xyz: [longMm, shortMm, 0] },
+                ];
+            },
+        },
+        'custom': {
+            label: 'Custom (define your own anchors below)',
+            anchors: null,  // sentinel: parsed from the custom-anchors textarea
+        },
+    };
+
+    // Sane upper bound on declared dimensions. Most physical parts the
+    // toolkit targets fit in a 1m³ envelope; 10m gives plenty of slack
+    // without admitting absurdly-large values that would overflow other
+    // float math downstream. Backend re-validates at /api/anchors.
+    var MAX_DIMENSION_MM = 10_000;
+
     // Initialize global wizard state. Subsequent phases read this.
-    window.spatialState = window.spatialState || { photos: {} };
+    window.spatialState = window.spatialState || { photos: {}, frame: null };
 
     function init() {
         // Wire phase controls FIRST, independent of /api/state. Without this,
@@ -236,6 +269,11 @@
     }
 
     function wirePhaseControls() {
+        wirePhase2a();
+        wirePhase2b();
+    }
+
+    function wirePhase2a() {
         var nextBtn = document.getElementById('phase-2a-next');
         if (nextBtn) {
             nextBtn.addEventListener('click', function () { advancePhase('2a', '2b'); });
@@ -267,6 +305,150 @@
         var to = document.getElementById('phase-' + toId);
         if (from) from.hidden = true;
         if (to) to.hidden = false;
+    }
+
+    function wirePhase2b() {
+        var presetSelect = document.getElementById('phase-2b-preset');
+        if (presetSelect) {
+            populatePresetOptions(presetSelect);
+            // Reveal the custom-anchors textarea only when the user picks
+            // the Custom preset. Other presets generate anchors from the
+            // long/short dimension inputs and don't need the textarea.
+            presetSelect.addEventListener('change', function () {
+                var customRow = document.getElementById('phase-2b-custom-anchors-row');
+                if (customRow) customRow.hidden = (presetSelect.value !== 'custom');
+            });
+        }
+        var nextBtn = document.getElementById('phase-2b-next');
+        if (!nextBtn) return;
+        nextBtn.addEventListener('click', function () {
+            var error = commitFrameAndAdvance();
+            var errorEl = document.getElementById('phase-2b-error');
+            if (error) {
+                if (errorEl) {
+                    errorEl.textContent = error;
+                    errorEl.hidden = false;
+                }
+                return;
+            }
+            if (errorEl) errorEl.hidden = true;
+            advancePhase('2b', '2c');
+        });
+    }
+
+    function populatePresetOptions(select) {
+        Object.keys(FRAME_PRESETS).forEach(function (key) {
+            var opt = document.createElement('option');
+            opt.value = key;
+            opt.textContent = FRAME_PRESETS[key].label;
+            select.appendChild(opt);
+        });
+    }
+
+    // Returns null on success (anchors committed to spatialState.frame),
+    // or a human-readable error string. Validation is intentionally light —
+    // the backend re-validates dimensions when /api/anchors is POSTed in
+    // Phase 2c — but we want the user to see "fix this here" rather than
+    // a back-button trip from a 400 response later.
+    function commitFrameAndAdvance() {
+        var presetEl = document.getElementById('phase-2b-preset');
+        var longEl = document.getElementById('phase-2b-long-edge');
+        var shortEl = document.getElementById('phase-2b-short-edge');
+        var notesEl = document.getElementById('phase-2b-notes');
+        var customAnchorsEl = document.getElementById('phase-2b-custom-anchors');
+
+        var preset = (presetEl || {}).value || '';
+        var notes = (notesEl || {}).value || '';
+
+        // Reject preset values that aren't in our table — defends against
+        // a stale DOM choice surviving a refactor that drops a preset.
+        var presetDef = FRAME_PRESETS[preset];
+        if (!preset || !presetDef) {
+            return 'Pick a frame preset before continuing.';
+        }
+
+        var longMm = readNumberInput(longEl);
+        var shortMm = readNumberInput(shortEl);
+        var anchors;
+
+        if (preset === 'custom') {
+            // Custom: parse the user-typed anchor definitions. Long/short
+            // dimensions are optional in custom mode (anchors carry their
+            // own coordinates, not derived from edge lengths).
+            var customText = (customAnchorsEl || {}).value || '';
+            var parsed;
+            try {
+                parsed = parseCustomAnchors(customText);
+            } catch (err) {
+                return 'Custom anchors: ' + err.message;
+            }
+            if (parsed.length < 1) {
+                return 'Custom mode needs at least one anchor (format: id: x, y, z).';
+            }
+            anchors = parsed;
+            // For custom mode, dimensions default to 0 if user left them
+            // blank — they're informational only and shipped to the agent
+            // alongside notes.
+            if (!isFinite(longMm)) longMm = 0;
+            if (!isFinite(shortMm)) shortMm = 0;
+        } else {
+            // Preset modes derive anchors from dimensions; both must be
+            // positive and within the sane upper bound.
+            if (!isFinite(longMm) || longMm <= 0 || longMm > MAX_DIMENSION_MM) {
+                return 'Enter a positive long-edge length (mm), at most ' + MAX_DIMENSION_MM + '.';
+            }
+            if (!isFinite(shortMm) || shortMm <= 0 || shortMm > MAX_DIMENSION_MM) {
+                return 'Enter a positive short-edge length (mm), at most ' + MAX_DIMENSION_MM + '.';
+            }
+            if (typeof presetDef.anchors !== 'function') {
+                return 'Preset "' + preset + '" has no anchor generator (likely a bug).';
+            }
+            anchors = presetDef.anchors(longMm, shortMm);
+        }
+
+        window.spatialState.frame = {
+            preset: preset,
+            longMm: longMm,
+            shortMm: shortMm,
+            notes: notes,
+            anchors: anchors,
+        };
+        return null;
+    }
+
+    // Read a numeric value from an <input type="number">. Prefers
+    // valueAsNumber (parses strictly, returns NaN on invalid) over
+    // parseFloat (which would silently accept "12abc" as 12).
+    function readNumberInput(el) {
+        if (!el) return NaN;
+        if (typeof el.valueAsNumber === 'number') return el.valueAsNumber;
+        return parseFloat(el.value);
+    }
+
+    // Parse the custom-anchor textarea. Each non-blank, non-comment
+    // line must match ``id: x, y, z`` where id is a valid identifier
+    // and x/y/z are finite numbers (mm). Throws on malformed lines.
+    // Lines starting with '#' are comments.
+    function parseCustomAnchors(text) {
+        var anchors = [];
+        var lines = text.split(/\r?\n/);
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i].trim();
+            if (!line || line.charAt(0) === '#') continue;
+            var match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([^,]+)\s*,\s*([^,]+)\s*,\s*([^,]+)\s*$/);
+            if (!match) {
+                throw new Error('line ' + (i + 1) + ' malformed (expected "id: x, y, z"): ' + line);
+            }
+            var id = match[1];
+            var x = parseFloat(match[2]);
+            var y = parseFloat(match[3]);
+            var z = parseFloat(match[4]);
+            if (!isFinite(x) || !isFinite(y) || !isFinite(z)) {
+                throw new Error('line ' + (i + 1) + ' has non-finite coordinate: ' + line);
+            }
+            anchors.push({ id: id, xyz: [x, y, z] });
+        }
+        return anchors;
     }
 
     if (document.readyState === 'loading') {

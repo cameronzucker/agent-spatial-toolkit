@@ -71,14 +71,7 @@ def pixel_to_part_local(
         raise ValueError("pixel_to_part_local: all numeric inputs must be finite (no NaN/Inf)")
 
     # Step 1: undistort the pixel
-    K = np.array(  # noqa: N806 — canonical CV name for camera matrix
-        [
-            [intrinsics.fx_px, 0, intrinsics.cx],
-            [0, intrinsics.fy_px, intrinsics.cy],
-            [0, 0, 1],
-        ],
-        dtype=np.float64,
-    )
+    K = intrinsics.to_camera_matrix()  # noqa: N806 — canonical CV name for camera matrix
     dist = np.array(intrinsics.distortion, dtype=np.float64)
     pix_in = pixel.astype(np.float64).reshape(-1, 1, 2)
     try:

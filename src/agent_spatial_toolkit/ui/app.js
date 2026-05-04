@@ -558,6 +558,7 @@
             currentAnchorId: null,
             clicks: {},  // anchor_id -> {x, y}
             imageSize: null,
+            attempts: 0,  // per-photo solve attempts (1 retry max per spec §3 Phase 2c)
         };
         anchors.forEach(function (anchor) {
             checklist.appendChild(buildAnchorChecklistRow(anchor, card, state));
@@ -679,6 +680,9 @@
             }
         }
         // No lens_id picked → server returns 400; surface as a clear error.
+        // (state.attempts is incremented inside the success branch below
+        // when intrinsics_suspect=true — spec §3 Phase 2c counts retry-on-RMS,
+        // not retry-on-any-error. Failed POSTs don't burn the budget.)
 
         var solveBtn = card.querySelector('.phase-2c-solve-btn');
         if (solveBtn) solveBtn.disabled = true;
@@ -714,6 +718,113 @@
                 // Enable Next once at least one photo has a solved pose.
                 var nextBtn = document.getElementById('phase-2c-next');
                 if (nextBtn) nextBtn.disabled = false;
+
+                // Append the wireframe overlay <img>. Removes any previous one
+                // first (after a re-click + re-solve, we want the new wireframe).
+                // Also remove any stale wireframe-note from a previous failed
+                // render — otherwise the note would still be visible after a
+                // successful retry.
+                var oldWireframe = card.querySelector('.phase-2c-wireframe');
+                if (oldWireframe) oldWireframe.remove();
+                var oldWireframeNote = card.querySelector('.phase-2c-wireframe-note');
+                if (oldWireframeNote) oldWireframeNote.remove();
+                var wireframeImg = document.createElement('img');
+                wireframeImg.className = 'phase-2c-wireframe';
+                // Cache-bust so a retry's PNG isn't served from the browser cache.
+                wireframeImg.src = '/api/wireframe/' + encodeURIComponent(photoId) + '?t=' + Date.now();
+                wireframeImg.alt = 'wireframe for ' + photoId;
+                wireframeImg.onerror = function () {
+                    // Wireframe render can fail (e.g., missing photo file in dev fixtures).
+                    // Surface a small note rather than leaving a broken-image icon.
+                    var note = document.createElement('p');
+                    note.className = 'phase-2c-wireframe-note';
+                    note.textContent = '(wireframe render unavailable)';
+                    wireframeImg.replaceWith(note);
+                };
+                card.appendChild(wireframeImg);
+
+                // Remove any previous retry controls
+                var oldControls = card.querySelector('.phase-2c-retry-controls');
+                if (oldControls) oldControls.remove();
+
+                if (suspect) {
+                    // Count this suspect solve toward the retry budget. Only
+                    // suspect solves count — failed POSTs (network, missing
+                    // lens, PnP error) don't burn the budget, per spec §3
+                    // Phase 2c "retry-on-RMS, not retry-on-any-request".
+                    state.attempts += 1;
+
+                    var controls = document.createElement('div');
+                    controls.className = 'phase-2c-retry-controls';
+
+                    var msg = document.createElement('p');
+                    if (state.attempts === 1) {
+                        msg.textContent = (
+                            'Pose computed but reprojection RMS is high — intrinsics may be off. ' +
+                            'Re-click anchors more carefully, or accept and continue.'
+                        );
+                    } else {
+                        msg.textContent = (
+                            'Second solve still suspect. Photo will be marked uncalibrated; ' +
+                            'features clicked here become annotation-only (no pose).'
+                        );
+                    }
+                    controls.appendChild(msg);
+
+                    if (state.attempts === 1) {
+                        var reclickBtn = document.createElement('button');
+                        reclickBtn.type = 'button';
+                        reclickBtn.className = 'phase-2c-reclick-btn';
+                        reclickBtn.textContent = 'Re-click anchors';
+                        reclickBtn.addEventListener('click', function () {
+                            // Clear clicks + remove "complete" markers from checklist.
+                            state.clicks = {};
+                            state.currentAnchorId = null;
+                            var rows = card.querySelectorAll('.phase-2c-checklist-row');
+                            rows.forEach(function (r) {
+                                r.classList.remove('complete', 'armed');
+                                var st = r.querySelector('.phase-2c-anchor-status');
+                                if (st) st.textContent = '';
+                            });
+                            if (solveBtn) solveBtn.disabled = true;
+                            controls.remove();
+                            // Clear result + wireframe to make the reset visible.
+                            clearChildren(resultEl);
+                            var wf = card.querySelector('.phase-2c-wireframe');
+                            if (wf) wf.remove();
+                        });
+                        controls.appendChild(reclickBtn);
+                    } else {
+                        // attempts >= 2: offer skip + continue-anyway, mark
+                        // photo uncalibrated on continue-anyway.
+                        var skipBtn = document.createElement('button');
+                        skipBtn.type = 'button';
+                        skipBtn.className = 'phase-2c-skip-btn';
+                        skipBtn.textContent = 'Skip this photo';
+                        skipBtn.addEventListener('click', function () {
+                            window.spatialState.photos[photoId].uncalibrated = true;
+                            window.spatialState.photos[photoId].skipped = true;
+                            controls.remove();
+                            resultEl.className = 'phase-2c-result';
+                            resultEl.textContent = 'Photo skipped (uncalibrated).';
+                        });
+                        controls.appendChild(skipBtn);
+
+                        var continueBtn = document.createElement('button');
+                        continueBtn.type = 'button';
+                        continueBtn.className = 'phase-2c-continue-btn';
+                        continueBtn.textContent = 'Continue anyway';
+                        continueBtn.addEventListener('click', function () {
+                            window.spatialState.photos[photoId].uncalibrated = true;
+                            controls.remove();
+                            resultEl.className = 'phase-2c-result';
+                            resultEl.textContent = 'Photo marked uncalibrated; clicks become annotation-only.';
+                        });
+                        controls.appendChild(continueBtn);
+                    }
+
+                    card.appendChild(controls);
+                }
             })
             .catch(function (err) {
                 clearChildren(resultEl);

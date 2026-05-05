@@ -744,12 +744,54 @@ def _register_routes(app: Flask) -> None:
                 501,
             )
 
-        try:
-            feature_id = body["feature_id"]
-            photo_id = body["photo_id"]
-            pixel_in = body["pixel"]
-        except (KeyError, TypeError):
-            return jsonify({"error": "missing required field (feature_id, photo_id, pixel)"}), 400
+        # Wizard-redesign (PR-2 Task 5): the new request shape carries a
+        # ``clicks`` list of ``{photo_id, pixel}`` entries.
+        #   - len == 1  → unwrap into the existing single-view ray-cast path.
+        #   - len >= 2  → triangulation, deferred to PR-3 (HTTP 501 stub).
+        #   - len == 0  → 400.
+        # The legacy shape (top-level photo_id + pixel, no ``clicks`` key)
+        # is preserved during the transition until PR-4 migrates UI callers.
+        if "clicks" in body:
+            clicks = body["clicks"]
+            if not isinstance(clicks, list):
+                return jsonify({"error": "clicks must be an array"}), 400
+            if len(clicks) == 0:
+                return jsonify({"error": "clicks must contain at least one entry"}), 400
+            if len(clicks) >= 2:
+                return (
+                    jsonify(
+                        {
+                            "error": "triangulation not yet implemented; arrives in PR-3",
+                            "n_clicks_received": len(clicks),
+                        }
+                    ),
+                    501,
+                )
+            # Single-click case: unwrap clicks[0] into the legacy fields the
+            # existing ray-cast logic below already understands.
+            try:
+                feature_id = body["feature_id"]
+                first_click = clicks[0]
+                photo_id = first_click["photo_id"]
+                pixel_in = first_click["pixel"]
+            except (KeyError, TypeError):
+                return (
+                    jsonify(
+                        {
+                            "error": "missing required field (feature_id, clicks[0].photo_id, clicks[0].pixel)"
+                        }
+                    ),
+                    400,
+                )
+        else:
+            try:
+                feature_id = body["feature_id"]
+                photo_id = body["photo_id"]
+                pixel_in = body["pixel"]
+            except (KeyError, TypeError):
+                return jsonify(
+                    {"error": "missing required field (feature_id, photo_id, pixel)"}
+                ), 400
 
         try:
             z_assumed_mm = _coerce_finite_float(body.get("z_assumed_mm", 0.0), "z_assumed_mm")

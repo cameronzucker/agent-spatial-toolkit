@@ -223,6 +223,103 @@ def test_feature_route_unknown_photo_returns_404(app_factory) -> None:
     assert "error" in resp.get_json()
 
 
+def test_post_feature_single_click_uses_existing_ray_cast(app_factory) -> None:
+    """POST /api/feature with clicks=[{photo_id, pixel}] (one entry) returns
+    pcb_xyz_mm via the existing single-view ray-cast path."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    # Establish a pose for the photo (legacy /api/anchors path is fine for setup).
+    anchors_resp = client.post("/api/anchors", json=_valid_anchors_payload())
+    assert anchors_resp.status_code == 200, anchors_resp.get_json()
+
+    resp = client.post(
+        "/api/feature",
+        json={
+            "feature_id": "f1",
+            "clicks": [{"photo_id": "top_down", "pixel": [500.0, 500.0]}],
+            "z_assumed_mm": 0.0,
+        },
+    )
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    assert "pcb_xyz_mm" in body
+    assert len(body["pcb_xyz_mm"]) == 3
+    assert body["pcb_xyz_mm"][2] == pytest.approx(0.0)
+
+
+def test_post_feature_two_clicks_returns_501(app_factory) -> None:
+    """POST /api/feature with 2 clicks returns 501 (triangulation deferred to PR-3)."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    # Establish pose so we get past prerequisite checks (state must exist for
+    # the route to be exercised end-to-end; the 501 short-circuit fires before
+    # any per-photo lookups but keeping the setup mirrors the real wizard flow).
+    anchors_resp = client.post("/api/anchors", json=_valid_anchors_payload())
+    assert anchors_resp.status_code == 200, anchors_resp.get_json()
+
+    resp = client.post(
+        "/api/feature",
+        json={
+            "feature_id": "f1",
+            "clicks": [
+                {"photo_id": "top_down", "pixel": [500.0, 500.0]},
+                {"photo_id": "top_down", "pixel": [400.0, 400.0]},
+            ],
+        },
+    )
+    assert resp.status_code == 501
+    body = resp.get_json()
+    assert "error" in body
+    assert "triangulation" in body["error"].lower()
+    assert "PR-3" in body["error"]
+    assert body["n_clicks_received"] == 2
+
+
+def test_post_feature_zero_clicks_returns_400(app_factory) -> None:
+    """POST /api/feature with clicks=[] returns 400."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    resp = client.post(
+        "/api/feature",
+        json={
+            "feature_id": "f1",
+            "clicks": [],
+        },
+    )
+    assert resp.status_code == 400
+    assert "error" in resp.get_json()
+
+
+def test_post_feature_legacy_single_pixel_shape_still_works(app_factory) -> None:
+    """Legacy shape (top-level photo_id + pixel, no clicks) still returns 200.
+
+    Backwards-compat regression: PR-4 will migrate UI callers; until then this
+    path must remain operational.
+    """
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    anchors_resp = client.post("/api/anchors", json=_valid_anchors_payload())
+    assert anchors_resp.status_code == 200, anchors_resp.get_json()
+
+    resp = client.post(
+        "/api/feature",
+        json={
+            "feature_id": "f1",
+            "photo_id": "top_down",
+            "pixel": [500.0, 500.0],
+            "z_assumed_mm": 0.0,
+        },
+    )
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    assert "pcb_xyz_mm" in body
+    assert len(body["pcb_xyz_mm"]) == 3
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # POST /api/finalize
 # ─────────────────────────────────────────────────────────────────────────

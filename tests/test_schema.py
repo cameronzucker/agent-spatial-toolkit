@@ -391,3 +391,51 @@ def test_validate_annotations_invalid_flag_raises() -> None:
     data = {"quality_summary": {"flags": ["totally_made_up_flag"]}}
     with pytest.raises(ValidationError, match="not a recognized flag"):
         validate_annotations(data)
+
+
+def _make_feature(noisy: bool = False, warning: str | None = None) -> Feature:
+    """Helper: minimal valid Feature for noisy/warning tests."""
+    return Feature(
+        id="usb_c",
+        visible_in=["photo_001", "photo_002"],
+        pcb_xyz_mm=(12.4, 28.3, 5.1),
+        measurements=FeatureMeasurement(
+            method="triangulation_2_views",
+            per_photo_clicks=[
+                FeatureClick(photo="photo_001", pixel=(100, 200), reprojection_residual_px=0.4),
+                FeatureClick(photo="photo_002", pixel=(110, 210), reprojection_residual_px=0.3),
+            ],
+            triangulation_rms_px=0.35,
+            max_residual_px=0.4,
+        ),
+        noisy=noisy,
+        warning=warning,
+    )
+
+
+def test_feature_noisy_default_false_omitted_from_dict() -> None:
+    """Default-False noisy must be omitted from to_dict() output (matches user_tags pattern)."""
+    f = _make_feature()  # noisy defaults to False
+    d = f.to_dict()
+    assert "noisy" not in d, "default-False noisy must not appear in to_dict() output"
+
+
+def test_feature_noisy_true_emitted_in_dict() -> None:
+    """noisy=True is emitted in to_dict() output for yellow-band reprojection features."""
+    f = _make_feature(noisy=True)
+    d = f.to_dict()
+    assert d["noisy"] is True
+
+
+def test_feature_warning_default_none_omitted_from_dict() -> None:
+    """Default-None warning must be omitted from to_dict() output (matches user_tags pattern)."""
+    f = _make_feature()  # warning defaults to None
+    d = f.to_dict()
+    assert "warning" not in d, "default-None warning must not appear in to_dict() output"
+
+
+def test_feature_warning_string_emitted_in_dict() -> None:
+    """A non-None warning string is emitted verbatim in to_dict() output."""
+    f = _make_feature(warning="Z is approximate; only 1 view available")
+    d = f.to_dict()
+    assert d["warning"] == "Z is approximate; only 1 view available"

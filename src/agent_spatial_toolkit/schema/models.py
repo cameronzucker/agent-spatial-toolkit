@@ -162,6 +162,13 @@ class Feature:
     pcb_xyz_mm: tuple[float, float, float]
     measurements: FeatureMeasurement
     user_tags: list[str] = field(default_factory=list)
+    noisy: bool = False
+    """True when triangulation reprojection error falls in the yellow band
+    (0.5–1.0 mm). Set by the redesigned wizard's tier-classification logic.
+    Emitted only when True (default-False is omitted)."""
+    warning: str | None = None
+    """Free-text human-readable note (e.g., 'Z is approximate; only 1 view
+    available' for single-view-planar features). Emitted only when set."""
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -172,6 +179,10 @@ class Feature:
         }
         if self.user_tags:
             d["user_tags"] = list(self.user_tags)
+        if self.noisy:
+            d["noisy"] = True
+        if self.warning is not None:
+            d["warning"] = self.warning
         return d
 
 

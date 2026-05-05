@@ -314,10 +314,12 @@ def test_validate_quality_flag_parameterized_must_have_id() -> None:
 
 
 def test_quality_flags_constant_is_complete() -> None:
-    """The closed enum contains all six flags from spec §6."""
+    """The closed enum contains all flags from spec §6 plus wizard-redesign extensions."""
     expected = {
         "intrinsics_suspect_high_anchor_rms",
         "intrinsics_session_recommend_chessboard",
+        "intrinsics_estimated",  # wizard redesign PR-1: EXIF-missing FOV fallback
+        "underside_unverified",  # wizard redesign PR-1: underside non-goal (design §1)
         "photo_excluded_due_to_pose_failure",
         "feature_clicked_only_once",
         "feature_high_triangulation_rms",
@@ -344,6 +346,27 @@ def test_validate_quality_flag_rejects_multi_colon_suffix() -> None:
         validate_quality_flag("feature_clicked_only_once:foo:bar")
 
 
+def test_intrinsics_estimated_flag_accepted() -> None:
+    """Parameterless flag for FOV-class fallback when EXIF intrinsics are missing."""
+    # Should not raise — parameterless flag, valid as-is.
+    validate_quality_flag("intrinsics_estimated")
+
+
+def test_intrinsics_estimated_flag_rejects_suffix() -> None:
+    """Parameterless flags must not carry an :<id> suffix."""
+    with pytest.raises(ValidationError, match="does not take an :<id> suffix"):
+        validate_quality_flag("intrinsics_estimated:photo_001")
+
+
+def test_underside_unverified_flag_accepted() -> None:
+    validate_quality_flag("underside_unverified")
+
+
+def test_underside_unverified_flag_rejects_suffix() -> None:
+    with pytest.raises(ValidationError, match="does not take an :<id> suffix"):
+        validate_quality_flag("underside_unverified:feature_42")
+
+
 def test_validate_annotations_happy_path() -> None:
     """A document with valid flags passes validation."""
     data = {
@@ -368,3 +391,51 @@ def test_validate_annotations_invalid_flag_raises() -> None:
     data = {"quality_summary": {"flags": ["totally_made_up_flag"]}}
     with pytest.raises(ValidationError, match="not a recognized flag"):
         validate_annotations(data)
+
+
+def _make_feature(noisy: bool = False, warning: str | None = None) -> Feature:
+    """Helper: minimal valid Feature for noisy/warning tests."""
+    return Feature(
+        id="usb_c",
+        visible_in=["photo_001", "photo_002"],
+        pcb_xyz_mm=(12.4, 28.3, 5.1),
+        measurements=FeatureMeasurement(
+            method="triangulation_2_views",
+            per_photo_clicks=[
+                FeatureClick(photo="photo_001", pixel=(100, 200), reprojection_residual_px=0.4),
+                FeatureClick(photo="photo_002", pixel=(110, 210), reprojection_residual_px=0.3),
+            ],
+            triangulation_rms_px=0.35,
+            max_residual_px=0.4,
+        ),
+        noisy=noisy,
+        warning=warning,
+    )
+
+
+def test_feature_noisy_default_false_omitted_from_dict() -> None:
+    """Default-False noisy must be omitted from to_dict() output (matches user_tags pattern)."""
+    f = _make_feature()  # noisy defaults to False
+    d = f.to_dict()
+    assert "noisy" not in d, "default-False noisy must not appear in to_dict() output"
+
+
+def test_feature_noisy_true_emitted_in_dict() -> None:
+    """noisy=True is emitted in to_dict() output for yellow-band reprojection features."""
+    f = _make_feature(noisy=True)
+    d = f.to_dict()
+    assert d["noisy"] is True
+
+
+def test_feature_warning_default_none_omitted_from_dict() -> None:
+    """Default-None warning must be omitted from to_dict() output (matches user_tags pattern)."""
+    f = _make_feature()  # warning defaults to None
+    d = f.to_dict()
+    assert "warning" not in d, "default-None warning must not appear in to_dict() output"
+
+
+def test_feature_warning_string_emitted_in_dict() -> None:
+    """A non-None warning string is emitted verbatim in to_dict() output."""
+    f = _make_feature(warning="Z is approximate; only 1 view available")
+    d = f.to_dict()
+    assert d["warning"] == "Z is approximate; only 1 view available"

@@ -1019,19 +1019,6 @@ def test_marker_detect_stub_returns_null_corners(app_factory) -> None:
     assert response.get_json() == {"corners": None}
 
 
-def test_next_prompt_stub_returns_typed_shape(app_factory) -> None:
-    """PR-2 stub returns the shape the UI expects; PR-3 implements scoring."""
-    app, session, server = app_factory()
-    client = app.test_client()
-    response = client.get("/api/next_prompt")
-    assert response.status_code == 200
-    body = response.get_json()
-    assert body["direction"] in {"top", "+long", "-long", "+short", "-short"}
-    assert "reason" in body
-    assert isinstance(body["coverage_cells"], dict)
-    assert "PR-3" in body["reason"], "stub reason must self-document as not-yet-implemented"
-
-
 def test_reproject_all_stub_returns_empty_features(app_factory) -> None:
     app, session, server = app_factory()
     client = app.test_client()
@@ -1134,3 +1121,40 @@ def test_marker_detect_returns_404_when_photo_missing(app_factory) -> None:
     client = app.test_client()
     resp = client.get("/api/marker_detect/no_such_photo")
     assert resp.status_code == 404
+
+
+def test_next_prompt_no_state_starts_with_top(app_factory) -> None:
+    """A fresh session starts with direction='top'."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    resp = client.get("/api/next_prompt")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["direction"] == "top"
+    assert "coverage_cells" in body
+    assert "features" in body
+
+
+def test_next_prompt_after_top_photo_advances_to_side(app_factory) -> None:
+    """After a top-down photo with a single-view feature, prompt picks a side."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    anchors_resp = client.post("/api/anchors", json=_valid_anchors_payload())
+    assert anchors_resp.status_code == 200
+    feature_resp = client.post(
+        "/api/feature",
+        json={
+            "feature_id": "f1",
+            "photo_id": "top_down",
+            "pixel": [500.0, 500.0],
+            "z_assumed_mm": 0.0,
+        },
+    )
+    assert feature_resp.status_code == 200
+
+    resp = client.get("/api/next_prompt")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["direction"] != "top"  # advanced past top
+    assert body["direction"] in {"+long", "-long", "+short", "-short"}
+    assert "second view" in body["reason"].lower() or "another angle" in body["reason"].lower()

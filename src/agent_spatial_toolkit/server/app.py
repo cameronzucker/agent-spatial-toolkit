@@ -1011,22 +1011,52 @@ def _register_routes(app: Flask) -> None:
 
     @app.get("/api/next_prompt")
     def get_next_prompt() -> Any:
-        """Stub: returns typed shape with placeholder values; real
-        scoring algorithm (design §4) lands in PR-3."""
-        return jsonify(
-            {
-                "direction": "+long",
-                "reason": "Server scoring not yet implemented (PR-3)",
-                "coverage_cells": {
-                    "top": False,
-                    "+long": False,
-                    "-long": False,
-                    "+short": False,
-                    "-short": False,
-                },
-                "features": [],
-            }
+        """Return the next-photo prompt per design §4 scoring algorithm.
+
+        Computes per-feature `max_error_mm` from the stored triangulation
+        residuals so the suppression rule (≥6 features uniformly green-tier)
+        can fire even with fewer than 3 cells filled.
+        """
+        from agent_spatial_toolkit.pipeline.error_mm import (
+            feature_error_mm_triangulated,
         )
+        from agent_spatial_toolkit.server.next_prompt import score_next_prompt
+
+        mem: dict[str, Any] = app.config["STATE"]
+
+        photos_in: list[dict[str, Any]] = []
+        for photo_id, entry in mem["photos"].items():
+            pose = entry.get("pose")
+            if isinstance(pose, PoseResult):
+                photos_in.append({"id": photo_id, "pose": pose})
+
+        features_in: list[dict[str, Any]] = []
+        for feature_id, feat in mem["features"].items():
+            method = feat.get("method", "")
+            entry = {"id": feature_id, "method": method}
+            # For triangulated features, compute the worst per-photo mm error
+            # so score_next_prompt can apply the suppression rule.
+            if method.startswith("triangulation_"):
+                xyz = np.array(feat.get("pcb_xyz_mm", [0.0, 0.0, 0.0]), dtype=np.float64)
+                clicks = feat.get("clicks", [])
+                worst_mm = 0.0
+                for click in clicks:
+                    photo_entry = mem["photos"].get(click.get("photo_id"))
+                    if photo_entry is None or not isinstance(photo_entry.get("pose"), PoseResult):
+                        continue
+                    intrinsics = _intrinsics_from_dict(photo_entry["intrinsics"])
+                    err_mm = feature_error_mm_triangulated(
+                        feature_xyz_mm=xyz,
+                        pose=photo_entry["pose"],
+                        intrinsics=intrinsics,
+                        residual_px=float(click.get("reprojection_residual_px", 0.0)),
+                    )
+                    if err_mm > worst_mm:
+                        worst_mm = err_mm
+                entry["max_error_mm"] = worst_mm
+            features_in.append(entry)
+
+        return jsonify(score_next_prompt(photos=photos_in, features=features_in))
 
     @app.get("/api/reproject_all")
     def get_reproject_all() -> Any:

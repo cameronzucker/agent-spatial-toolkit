@@ -289,6 +289,22 @@ def create_app(server: _ShutdownableServer, session: Session) -> Flask:
         "flags": [],
     }
 
+    # Short-circuit oversize bodies at the WSGI layer rather than reading the
+    # full payload into memory before checking. The /api/photo route also
+    # has its own 413 check as defense-in-depth (some clients use chunked
+    # transfer-encoding without Content-Length, which bypasses this gate).
+    app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
+
+    @app.errorhandler(413)
+    def _too_large(_e: Any) -> Any:
+        """Friendly 413 message; matches the in-route check's wording."""
+        return (
+            jsonify(
+                {"error": "This photo is unusually large (>50 MB) — reshoot at lower resolution."}
+            ),
+            413,
+        )
+
     _register_routes(app)
     return app
 

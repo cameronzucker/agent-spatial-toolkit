@@ -314,10 +314,11 @@ def test_validate_quality_flag_parameterized_must_have_id() -> None:
 
 
 def test_quality_flags_constant_is_complete() -> None:
-    """The closed enum contains all six flags from spec §6."""
+    """The closed enum contains all flags from spec §6 plus wizard-redesign extensions."""
     expected = {
         "intrinsics_suspect_high_anchor_rms",
         "intrinsics_session_recommend_chessboard",
+        "intrinsics_estimated",  # wizard redesign PR-1: EXIF-missing FOV fallback
         "photo_excluded_due_to_pose_failure",
         "feature_clicked_only_once",
         "feature_high_triangulation_rms",
@@ -342,6 +343,18 @@ def test_validate_quality_flag_rejects_multi_colon_suffix() -> None:
     """A parameterized flag with multiple colons must raise (spec §6 single-token id)."""
     with pytest.raises(ValidationError, match="multi-colon"):
         validate_quality_flag("feature_clicked_only_once:foo:bar")
+
+
+def test_intrinsics_estimated_flag_accepted() -> None:
+    """Parameterless flag for FOV-class fallback when EXIF intrinsics are missing."""
+    # Should not raise — parameterless flag, valid as-is.
+    validate_quality_flag("intrinsics_estimated")
+
+
+def test_intrinsics_estimated_flag_rejects_suffix() -> None:
+    """Parameterless flags must not carry an :<id> suffix."""
+    with pytest.raises(ValidationError, match="does not take an :<id> suffix"):
+        validate_quality_flag("intrinsics_estimated:photo_001")
 
 
 def test_validate_annotations_happy_path() -> None:

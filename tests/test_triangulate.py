@@ -224,7 +224,10 @@ def test_residuals_grow_when_pixel_is_off() -> None:
     views = [(pose1, intr, p1), (pose2, intr, perturbed_p2), (pose3, intr, p3)]
     result = triangulate_feature(views)
     # The off-pixel will show up as residual error on at least one view.
-    assert max(result.per_click_residuals_px) > 1.0
+    # Threshold chosen empirically: actual max residual is ~1.54 px for this
+    # 3-view setup; 1.3 gives meaningful regression coverage (catches SVD
+    # silently masking the perturbation) without flake-risk headroom.
+    assert max(result.per_click_residuals_px) > 1.3
 
 
 def test_non_finite_pixel_raises() -> None:

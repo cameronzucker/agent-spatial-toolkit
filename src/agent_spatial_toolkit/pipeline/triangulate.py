@@ -26,8 +26,8 @@ import numpy as np
 from agent_spatial_toolkit.pipeline.intrinsics import Intrinsics
 from agent_spatial_toolkit.pipeline.pose import PoseResult
 
+# (pose, intrinsics, (u, v))
 ViewClick = tuple[PoseResult, Intrinsics, tuple[float, float]]
-"""(pose, intrinsics, (u, v))"""
 
 # Schema enum caps at triangulation_6_views (schema/models.py FeatureMeasurement.method).
 # Exceeding this would emit a method value the schema rejects.
@@ -51,7 +51,10 @@ class TriangulationResult:
 
 def _projection_matrix(pose: PoseResult, intrinsics: Intrinsics) -> np.ndarray:
     """Build the 3x4 projection matrix P = K @ [R | t] for one view."""
-    R, _ = cv2.Rodrigues(pose.rvec.astype(np.float64))  # noqa: N806 — canonical CV name
+    try:
+        R, _ = cv2.Rodrigues(pose.rvec.astype(np.float64))  # noqa: N806 — canonical CV name
+    except cv2.error as e:
+        raise TriangulationError(f"cv2.Rodrigues failed: {e}") from e
     K = intrinsics.to_camera_matrix()  # noqa: N806 — canonical CV name
     Rt = np.hstack([R, pose.tvec.astype(np.float64).reshape(3, 1)])  # noqa: N806
     return K @ Rt
@@ -71,7 +74,10 @@ def _undistort_pixel(
     K = intrinsics.to_camera_matrix()  # noqa: N806
     dist = np.array(intrinsics.distortion, dtype=np.float64)
     pts = np.array([[pixel[0], pixel[1]]], dtype=np.float64).reshape(-1, 1, 2)
-    undistorted = cv2.undistortPoints(pts, K, dist, P=K).reshape(2)
+    try:
+        undistorted = cv2.undistortPoints(pts, K, dist, P=K).reshape(2)
+    except cv2.error as e:
+        raise TriangulationError(f"cv2.undistortPoints failed: {e}") from e
     return float(undistorted[0]), float(undistorted[1])
 
 
@@ -105,16 +111,24 @@ def triangulate_feature(views: list[ViewClick]) -> TriangulationResult:
     # Undistort every pixel; from here on we work in linear-camera coords.
     undistorted_pixels = [_undistort_pixel(p, intr) for _, intr, p in views]
 
+    # Defensive: cv2.undistortPoints can produce non-finite output for
+    # pathological distortion + pixel combinations even when the raw
+    # inputs were finite. Catch at the boundary instead of letting NaN
+    # poison the SVD downstream.
+    for i, (u, v) in enumerate(undistorted_pixels):
+        if not (math.isfinite(u) and math.isfinite(v)):
+            raise TriangulationError(
+                f"view {i} produced non-finite undistorted pixel (input was likely degenerate)"
+            )
+
     # Build the DLT system. For each view, the observed pixel (u, v) and
     # projection matrix P give two linear constraints on the homogeneous
     # 3D point X:
     #   u * P[2] - P[0] = 0
     #   v * P[2] - P[1] = 0
     rows: list[np.ndarray] = []
-    projection_matrices: list[np.ndarray] = []
     for (pose, intrinsics, _), (u, v) in zip(views, undistorted_pixels, strict=True):
         P = _projection_matrix(pose, intrinsics)  # noqa: N806
-        projection_matrices.append(P)
         rows.append(u * P[2] - P[0])
         rows.append(v * P[2] - P[1])
     A = np.array(rows, dtype=np.float64)  # noqa: N806
@@ -144,13 +158,16 @@ def triangulate_feature(views: list[ViewClick]) -> TriangulationResult:
     for pose, intrinsics, observed_pixel in views:
         K = intrinsics.to_camera_matrix()  # noqa: N806
         dist = np.array(intrinsics.distortion, dtype=np.float64)
-        projected, _ = cv2.projectPoints(
-            xyz.reshape(1, 1, 3).astype(np.float64),
-            pose.rvec.astype(np.float64),
-            pose.tvec.astype(np.float64),
-            K,
-            dist,
-        )
+        try:
+            projected, _ = cv2.projectPoints(
+                xyz.reshape(1, 1, 3).astype(np.float64),
+                pose.rvec.astype(np.float64),
+                pose.tvec.astype(np.float64),
+                K,
+                dist,
+            )
+        except cv2.error as e:
+            raise TriangulationError(f"cv2.projectPoints failed: {e}") from e
         u_proj, v_proj = projected.reshape(2)
         du = u_proj - observed_pixel[0]
         dv = v_proj - observed_pixel[1]

@@ -844,6 +844,41 @@ def _register_routes(app: Flask) -> None:
 
         return jsonify({"pcb_xyz_mm": pcb_xyz})
 
+    # ─────────────────────────────────────────────────────────────────
+    # Stub endpoints: contract surface for the redesigned wizard. Real
+    # logic for these arrives in PR-3; PR-2 ships the shapes only so
+    # the UI (PR-4) and PR-3's wiring can land independently.
+    # ─────────────────────────────────────────────────────────────────
+
+    @app.get("/api/marker_detect/<path:photo_id>")
+    def get_marker_detect(photo_id: str) -> Any:
+        """Stub: real cv2.aruco.detectMarkers wiring lands in PR-3."""
+        return jsonify({"corners": None})
+
+    @app.get("/api/next_prompt")
+    def get_next_prompt() -> Any:
+        """Stub: returns typed shape with placeholder values; real
+        scoring algorithm (design §4) lands in PR-3."""
+        return jsonify(
+            {
+                "direction": "+long",
+                "reason": "Server scoring not yet implemented (PR-3)",
+                "coverage_cells": {
+                    "top": False,
+                    "+long": False,
+                    "-long": False,
+                    "+short": False,
+                    "-short": False,
+                },
+                "features": [],
+            }
+        )
+
+    @app.get("/api/reproject_all")
+    def get_reproject_all() -> Any:
+        """Stub: PR-3 wires per-feature reprojection error in mm."""
+        return jsonify({"features": []})
+
     @app.post("/api/finalize")
     def post_finalize() -> Any:
         session: Session = app.config["SESSION"]

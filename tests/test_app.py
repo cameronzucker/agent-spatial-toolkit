@@ -863,3 +863,34 @@ def test_post_reference_wrong_corner_count_returns_400(app_factory) -> None:
             },
         )
         assert response.status_code == 400, f"expected 400 for n_corners={n_corners}"
+
+
+def test_marker_detect_stub_returns_null_corners(app_factory) -> None:
+    """PR-2 stub: no auto-detect yet; PR-3 wires cv2.aruco."""
+    app, session, server = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+    response = client.get(f"/api/marker_detect/{photo_id}")
+    assert response.status_code == 200
+    assert response.get_json() == {"corners": None}
+
+
+def test_next_prompt_stub_returns_typed_shape(app_factory) -> None:
+    """PR-2 stub returns the shape the UI expects; PR-3 implements scoring."""
+    app, session, server = app_factory()
+    client = app.test_client()
+    response = client.get("/api/next_prompt")
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["direction"] in {"top", "+long", "-long", "+short", "-short"}
+    assert "reason" in body
+    assert isinstance(body["coverage_cells"], dict)
+    assert "PR-3" in body["reason"], "stub reason must self-document as not-yet-implemented"
+
+
+def test_reproject_all_stub_returns_empty_features(app_factory) -> None:
+    app, session, server = app_factory()
+    client = app.test_client()
+    response = client.get("/api/reproject_all")
+    assert response.status_code == 200
+    assert response.get_json() == {"features": []}

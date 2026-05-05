@@ -319,6 +319,7 @@ def test_quality_flags_constant_is_complete() -> None:
         "intrinsics_suspect_high_anchor_rms",
         "intrinsics_session_recommend_chessboard",
         "intrinsics_estimated",  # wizard redesign PR-1: EXIF-missing FOV fallback
+        "underside_unverified",  # wizard redesign PR-1: underside non-goal (design §1)
         "photo_excluded_due_to_pose_failure",
         "feature_clicked_only_once",
         "feature_high_triangulation_rms",
@@ -355,6 +356,15 @@ def test_intrinsics_estimated_flag_rejects_suffix() -> None:
     """Parameterless flags must not carry an :<id> suffix."""
     with pytest.raises(ValidationError, match="does not take an :<id> suffix"):
         validate_quality_flag("intrinsics_estimated:photo_001")
+
+
+def test_underside_unverified_flag_accepted() -> None:
+    validate_quality_flag("underside_unverified")
+
+
+def test_underside_unverified_flag_rejects_suffix() -> None:
+    with pytest.raises(ValidationError, match="does not take an :<id> suffix"):
+        validate_quality_flag("underside_unverified:feature_42")
 
 
 def test_validate_annotations_happy_path() -> None:

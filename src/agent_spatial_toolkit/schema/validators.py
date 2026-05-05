@@ -14,6 +14,7 @@ QUALITY_FLAGS: dict[str, bool] = {
     "intrinsics_suspect_high_anchor_rms": False,  # parameterless
     "intrinsics_session_recommend_chessboard": False,
     "intrinsics_estimated": False,  # EXIF missing, fell back to FOV-class (design §3)
+    "underside_unverified": False,  # bottom-of-part not photographable; v1 non-goal (design §1)
     "photo_excluded_due_to_pose_failure": True,  # requires :<photo_id>
     "feature_clicked_only_once": True,  # requires :<feature_id>
     "feature_high_triangulation_rms": True,  # requires :<feature_id>

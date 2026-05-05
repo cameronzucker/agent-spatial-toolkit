@@ -29,6 +29,52 @@ Design notes
 - All error responses use the shape ``{"error": str}`` with no stack traces.
 """
 
+# PR-4-HANDOFF: user-facing-translation-required ----------------------------
+# Per design §9 (forbidden vocabulary) the strings listed below are NOT
+# safe to display verbatim in the wizard UI — they currently use CV jargon
+# that non-CAD users won't understand. PR-4's UI MUST translate each to
+# plain English before showing to the user. This list is exhaustive as of
+# PR-3 merge; if PR-4 adds new error strings, this list MUST be updated.
+#
+# Routes & strings:
+#   /api/anchors:
+#     - "PnP failed: anchors are degenerate or insufficient"
+#     - "must provide either intrinsics or lens_id"
+#     - "lens_id '<id>' could not resolve to intrinsics; provide an explicit
+#        intrinsics dict"
+#     - "invalid intrinsics: <e>"
+#     - "invalid anchor entries: <e>"
+#     - "internal error during pose solve"
+#   /api/reference:
+#     - "pose solve failed: corners may be too oblique or mis-clicked"
+#     - "could not derive camera intrinsics; provide an explicit intrinsics dict"
+#     - "invalid intrinsics: <e>"
+#     - "internal error during pose solve"
+#   /api/feature:
+#     - "no pose for photo <id>"   (multiple call sites: legacy + triangulation)
+#     - "photo '<id>' has no pose; call /api/anchors first"  (legacy fallback path)
+#     - "unknown photo_id '<id>' in clicks[<i>]"  (triangulation path)
+#     - "stored intrinsics are malformed: <e>"
+#     - "v1 triangulates from up to 6 views; received <N> — please reduce to
+#        your 6 best views"
+#     - "internal error during ray-cast"
+#     - "method '<m>' not implemented in v0.1.0-alpha (β-mode only)"
+#   /api/wireframe:
+#     - "no pose for photo <id>"
+#     - "stored intrinsics invalid: <e>"
+#     - "wireframe render failed: <e>"
+#   /api/marker_detect:
+#     - "photo file for <id> not found on disk"
+#   (Routes not listed here ship only plain-English errors safe to forward.)
+#
+# /api/next_prompt response: the `direction` field is an internal axis label
+# (e.g., '+long', '-short') — UI MUST render it as a silhouette icon, never
+# as prose. The `reason` field is a fallback English string that interpolates
+# the axis label literally; UI MUST render the localized prose from
+# `reason_code` (an enum) instead. The fallback `reason` is for debugger
+# inspection only.
+# ---------------------------------------------------------------------------
+
 from __future__ import annotations
 
 import hashlib

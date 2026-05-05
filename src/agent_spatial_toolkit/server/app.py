@@ -563,6 +563,169 @@ def _register_routes(app: Flask) -> None:
             }
         )
 
+    @app.post("/api/reference")
+    def post_reference() -> Any:
+        """Confirm scale via the wizard's 4-corner reference-object flow.
+
+        Design §2 step 4. Replaces the legacy ``/api/anchors`` path for the
+        redesigned wizard. Same ``cv2.solvePnP`` machinery, but the 4 world
+        points are derived from a known-dimensions reference type (credit
+        card, dollar bill, marker) rather than typed by the user.
+
+        The client POSTs ``{photo_id, reference_type, pixel_corners,
+        image_size}`` plus either an explicit ``intrinsics`` dict or a
+        ``lens_id`` (transitional; PR-3 adds full EXIF-auto + FOV-class
+        fallback). ``pixel_corners`` MUST be a list of exactly 4 ``[x, y]``
+        entries in clockwise-from-top-left order, index-aligned with the
+        world corners returned by ``get_corner_positions_mm``.
+        """
+        from agent_spatial_toolkit.server.reference_objects import (
+            ReferenceObjectError,
+            get_corner_positions_mm,
+        )
+
+        event_log: EventLog = app.config["EVENT_LOG"]
+        mem: dict[str, Any] = app.config["STATE"]
+
+        body = request.get_json(silent=True) or {}
+        try:
+            photo_id = body["photo_id"]
+            reference_type = body["reference_type"]
+            pixel_corners_in = body["pixel_corners"]
+            image_size_in = body["image_size"]
+        except (KeyError, TypeError):
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            "missing required field "
+                            "(photo_id, reference_type, pixel_corners, image_size)"
+                        )
+                    }
+                ),
+                400,
+            )
+
+        if not isinstance(pixel_corners_in, list) or len(pixel_corners_in) != 4:
+            return (
+                jsonify({"error": "pixel_corners must be an array of exactly 4 [x, y] entries"}),
+                400,
+            )
+
+        if not isinstance(image_size_in, list) or len(image_size_in) != 2:
+            return jsonify({"error": "image_size must be [width, height]"}), 400
+
+        try:
+            world_corners = get_corner_positions_mm(reference_type)
+        except ReferenceObjectError as e:
+            return jsonify({"error": str(e)}), 400
+
+        try:
+            image_size = (
+                _coerce_finite_int(image_size_in[0], "image_size[0]"),
+                _coerce_finite_int(image_size_in[1], "image_size[1]"),
+            )
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+
+        # Reuse intrinsics-resolution from /api/anchors (transitional;
+        # PR-3 adds full EXIF-auto + FOV-class fallback).
+        intrinsics_dict = body.get("intrinsics")
+        if intrinsics_dict is not None:
+            try:
+                intrinsics = _intrinsics_from_dict(intrinsics_dict)
+            except (KeyError, TypeError, ValueError) as e:
+                return jsonify({"error": f"invalid intrinsics: {e}"}), 400
+        else:
+            lens_id = body.get("lens_id")
+            if not lens_id:
+                return (
+                    jsonify({"error": "must provide either intrinsics or lens_id"}),
+                    400,
+                )
+            from agent_spatial_toolkit.server.lens_catalog import resolve as _resolve_lens
+
+            intr_obj = _resolve_lens(lens_id, image_size, exif=body.get("exif"))
+            if intr_obj is None:
+                return (
+                    jsonify(
+                        {
+                            "error": (
+                                f"lens_id '{lens_id}' could not resolve to intrinsics; "
+                                "provide an explicit intrinsics dict"
+                            )
+                        }
+                    ),
+                    400,
+                )
+            intrinsics = intr_obj
+            intrinsics_dict = intr_obj.to_dict()
+
+        try:
+            world_points = np.array(world_corners, dtype=np.float64)
+            pixel_points = np.array(pixel_corners_in, dtype=np.float64)
+            if pixel_points.shape != (4, 2):
+                raise ValueError("each pixel_corner must be [x, y]")
+        except (ValueError, TypeError) as e:
+            return jsonify({"error": f"invalid pixel_corners: {e}"}), 400
+
+        try:
+            pose = solve_pnp(world_points, pixel_points, intrinsics, image_size)
+        except PoseSolveError as e:
+            event_log.write(
+                {
+                    "type": "pose_failed",
+                    "photo_id": photo_id,
+                    "reference_type": reference_type,
+                    "error_detail": str(e),
+                }
+            )
+            return (
+                jsonify(
+                    {"error": ("pose solve failed: corners may be too oblique or mis-clicked")}
+                ),
+                400,
+            )
+        except Exception:
+            return jsonify({"error": "internal error during pose solve"}), 500
+
+        # Update in-memory state. Matches the photo-record shape established
+        # by /api/photo (Task 3): photo entry exists from upload, this route
+        # populates intrinsics + pose + reference fields. setdefault keeps
+        # the route safe even if the client somehow skipped /api/photo.
+        mem.setdefault("photos", {})
+        photo_record = mem["photos"].setdefault(
+            photo_id,
+            {
+                "id": photo_id,
+                "intrinsics": None,
+                "pose": None,
+                "anchors": [],
+            },
+        )
+        photo_record["intrinsics"] = intrinsics_dict
+        photo_record["pose"] = pose
+        photo_record["image_size"] = image_size
+        photo_record["reference_type"] = reference_type
+        photo_record["pixel_corners"] = pixel_corners_in
+
+        event_log.write(
+            {
+                "type": "reference_solved",
+                "photo_id": photo_id,
+                "reference_type": reference_type,
+                "anchor_reprojection_rms_px": pose.anchor_reprojection_rms_px,
+                "intrinsics_suspect": pose.intrinsics_suspect,
+            }
+        )
+
+        return jsonify(
+            {
+                "pose": pose.to_dict(),
+                "intrinsics_suspect": pose.intrinsics_suspect,
+            }
+        )
+
     @app.post("/api/feature")
     def post_feature() -> Any:
         event_log: EventLog = app.config["EVENT_LOG"]

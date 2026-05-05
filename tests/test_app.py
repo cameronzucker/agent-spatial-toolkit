@@ -71,6 +71,23 @@ def _valid_anchors_payload(image_size: tuple[int, int] = (1000, 1000)) -> dict:
     }
 
 
+def _upload_test_photo(client) -> str:
+    """Upload a small JPEG via /api/photo and return its photo_id.
+
+    Used by tests for routes that depend on a photo being in the session.
+    """
+    import io
+
+    from PIL import Image
+
+    img = Image.new("RGB", (200, 150), color=(128, 64, 200))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    response = client.post("/api/photo", data=buf.getvalue(), content_type="image/jpeg")
+    assert response.status_code == 200, f"photo upload failed: {response.get_json()}"
+    return response.get_json()["photo_id"]
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # GET /
 # ─────────────────────────────────────────────────────────────────────────
@@ -645,3 +662,107 @@ def test_wireframe_route_rejects_path_traversal(app_factory) -> None:
         assert resp.status_code in (400, 404), (
             f"Expected 400/404 for {evil!r}; got {resp.status_code}"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# POST /api/reference (wizard "confirm scale" — replaces /api/anchors)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_post_reference_credit_card_solves_pose(app_factory) -> None:
+    """A simulated 4-corner credit-card click produces a pose."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+    response = client.post(
+        "/api/reference",
+        json={
+            "photo_id": photo_id,
+            "reference_type": "credit_card",
+            "pixel_corners": [[100, 100], [400, 100], [400, 300], [100, 300]],
+            "image_size": [800, 600],
+            "intrinsics": _make_test_intrinsics_dict(800, 600),
+        },
+    )
+    assert response.status_code == 200, response.get_json()
+    body = response.get_json()
+    assert "pose" in body
+    assert "intrinsics_suspect" in body
+    assert body["pose"]["rvec"] is not None
+    assert body["pose"]["tvec"] is not None
+
+
+def test_post_reference_dollar_bill_uses_correct_dimensions(app_factory) -> None:
+    """Dollar-bill 4-corner clicks produce a pose with translation derived
+    from the larger reference dimensions (156.1 x 66.3 mm vs 85.6 x 53.98)."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+    response = client.post(
+        "/api/reference",
+        json={
+            "photo_id": photo_id,
+            "reference_type": "dollar_bill",
+            "pixel_corners": [[100, 100], [400, 100], [400, 300], [100, 300]],
+            "image_size": [800, 600],
+            "intrinsics": _make_test_intrinsics_dict(800, 600),
+        },
+    )
+    assert response.status_code == 200, response.get_json()
+
+
+def test_post_reference_unknown_type_returns_400(app_factory) -> None:
+    """Unknown reference_type returns 400 with 'unknown reference type' in error."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+    response = client.post(
+        "/api/reference",
+        json={
+            "photo_id": photo_id,
+            "reference_type": "not_a_real_type",
+            "pixel_corners": [[100, 100], [400, 100], [400, 300], [100, 300]],
+            "image_size": [800, 600],
+            "intrinsics": _make_test_intrinsics_dict(800, 600),
+        },
+    )
+    assert response.status_code == 400
+    assert "unknown reference type" in response.get_json()["error"].lower()
+
+
+def test_post_reference_missing_pixel_corners_returns_400(app_factory) -> None:
+    """Missing pixel_corners field returns 400."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+    response = client.post(
+        "/api/reference",
+        json={
+            "photo_id": photo_id,
+            "reference_type": "credit_card",
+            "image_size": [800, 600],
+            "intrinsics": _make_test_intrinsics_dict(800, 600),
+            # pixel_corners omitted
+        },
+    )
+    assert response.status_code == 400
+
+
+def test_post_reference_wrong_corner_count_returns_400(app_factory) -> None:
+    """Need exactly 4 corners; 3 or 5 must be rejected."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+    for n_corners in [3, 5]:
+        corners = [[100 + i * 10, 100] for i in range(n_corners)]
+        response = client.post(
+            "/api/reference",
+            json={
+                "photo_id": photo_id,
+                "reference_type": "credit_card",
+                "pixel_corners": corners,
+                "image_size": [800, 600],
+                "intrinsics": _make_test_intrinsics_dict(800, 600),
+            },
+        )
+        assert response.status_code == 400, f"expected 400 for n_corners={n_corners}"

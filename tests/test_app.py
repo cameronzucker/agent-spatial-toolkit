@@ -1009,6 +1009,86 @@ def test_post_reference_returns_pose_rms_mm(app_factory) -> None:
     assert body["pose_rms_mm"] < 5.0  # synthetic-clean clicks should be tight
 
 
+def test_post_reference_falls_back_to_default_intrinsics_when_no_exif(app_factory) -> None:
+    """Without intrinsics or lens_id, /api/reference still succeeds via the
+    FOV-class default, and quality_summary.flags carries 'intrinsics_estimated'."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+
+    # Project credit-card corners through a known pose (no intrinsics in payload).
+    import cv2 as _cv2
+
+    # Use what the FOV-default would compute: long_edge=200, focal_35=24 (wide-class).
+    # fx_px = 24 * 200 / 36 = 133.3
+    rvec = np.array([0.0, 0.0, 0.0])
+    tvec = np.array([-42.8, -27.0, 100.0])
+    K = np.array([[133.33, 0, 100.0], [0, 133.33, 75.0], [0, 0, 1]], dtype=np.float64)  # noqa: N806
+    world_corners = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [85.60, 0.0, 0.0],
+            [85.60, 53.98, 0.0],
+            [0.0, 53.98, 0.0],
+        ]
+    )
+    pixel_corners, _ = _cv2.projectPoints(world_corners, rvec, tvec, K, np.zeros(5))
+    pixel_corners = pixel_corners.reshape(-1, 2).tolist()
+
+    payload = {
+        "photo_id": photo_id,
+        "reference_type": "credit_card",
+        "pixel_corners": pixel_corners,
+        "image_size": [200, 150],
+        # No intrinsics, no lens_id, no exif.
+    }
+    resp = client.post("/api/reference", json=payload)
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    assert "pose" in body
+
+    state = client.get("/api/state").get_json()
+    assert "intrinsics_estimated" in state["flags"]
+
+
+def test_post_reference_uses_exif_focal_when_provided_in_request(app_factory) -> None:
+    """If the request body contains an `exif` dict with focal info, use it
+    instead of falling back to wide-class default. Flag still set
+    (intrinsics still 'estimated', not chessboard-calibrated)."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+
+    import cv2 as _cv2
+
+    # focal_35 = 28 (wide), long_edge=200 → fx_px = 28*200/36 = 155.5
+    rvec = np.array([0.0, 0.0, 0.0])
+    tvec = np.array([-42.8, -27.0, 100.0])
+    K = np.array([[155.55, 0, 100.0], [0, 155.55, 75.0], [0, 0, 1]], dtype=np.float64)  # noqa: N806
+    world_corners = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [85.60, 0.0, 0.0],
+            [85.60, 53.98, 0.0],
+            [0.0, 53.98, 0.0],
+        ]
+    )
+    pixel_corners, _ = _cv2.projectPoints(world_corners, rvec, tvec, K, np.zeros(5))
+    pixel_corners = pixel_corners.reshape(-1, 2).tolist()
+
+    payload = {
+        "photo_id": photo_id,
+        "reference_type": "credit_card",
+        "pixel_corners": pixel_corners,
+        "image_size": [200, 150],
+        "exif": {"focal_length_35mm_equiv": 28.0},
+    }
+    resp = client.post("/api/reference", json=payload)
+    assert resp.status_code == 200, resp.get_json()
+    state = client.get("/api/state").get_json()
+    assert "intrinsics_estimated" in state["flags"]
+
+
 def test_marker_detect_stub_returns_null_corners(app_factory) -> None:
     """PR-2 stub: no auto-detect yet; PR-3 wires cv2.aruco."""
     app, session, server = app_factory()

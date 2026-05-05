@@ -593,6 +593,7 @@ def _register_routes(app: Flask) -> None:
 
         event_log: EventLog = app.config["EVENT_LOG"]
         mem: dict[str, Any] = app.config["STATE"]
+        session: Session = app.config["SESSION"]
 
         body = request.get_json(silent=True) or {}
         try:
@@ -644,27 +645,71 @@ def _register_routes(app: Flask) -> None:
             except (KeyError, TypeError, ValueError) as e:
                 return jsonify({"error": f"invalid intrinsics: {e}"}), 400
         else:
+            # Fallback chain: lens_id (if provided) → EXIF (if photo on disk
+            # carries focal_35) → wide-class default. Each fallback raises
+            # the intrinsics_estimated flag for the LLM downstream.
             lens_id = body.get("lens_id")
-            if not lens_id:
-                return (
-                    jsonify({"error": "must provide either intrinsics or lens_id"}),
-                    400,
-                )
-            from agent_spatial_toolkit.server.lens_catalog import resolve as _resolve_lens
+            intr_obj: Intrinsics | None = None
 
-            intr_obj = _resolve_lens(lens_id, image_size, exif=body.get("exif"))
+            if lens_id:
+                from agent_spatial_toolkit.server.lens_catalog import resolve as _resolve_lens
+
+                intr_obj = _resolve_lens(lens_id, image_size, exif=body.get("exif"))
+
+            # EXIF in request body (UI extracted client-side).
             if intr_obj is None:
-                return (
-                    jsonify(
-                        {
-                            "error": (
-                                f"lens_id '{lens_id}' could not resolve to intrinsics; "
-                                "provide an explicit intrinsics dict"
-                            )
-                        }
-                    ),
-                    400,
+                exif = body.get("exif") or {}
+                focal_35 = exif.get("focal_length_35mm_equiv") if isinstance(exif, dict) else None
+                if focal_35 is not None:
+                    from agent_spatial_toolkit.pipeline.intrinsics import (
+                        resolve_fallback_intrinsics,
+                    )
+
+                    intr_obj = resolve_fallback_intrinsics(float(focal_35), image_size)
+
+            # EXIF read directly from the photo file on disk.
+            if intr_obj is None:
+                photos_dir = session.session_dir / "photos"
+                candidates = list(photos_dir.glob(f"{photo_id}.*"))
+                if candidates:
+                    from agent_spatial_toolkit.pipeline.intrinsics import (
+                        extract_exif_camera_info,
+                        resolve_fallback_intrinsics,
+                    )
+
+                    cam_info = extract_exif_camera_info(candidates[0])
+                    if cam_info is not None and cam_info.focal_length_35mm_equiv is not None:
+                        intr_obj = resolve_fallback_intrinsics(
+                            cam_info.focal_length_35mm_equiv, image_size
+                        )
+
+            # Final fallback: wide-class (24 mm 35mm-equiv) default.
+            if intr_obj is None:
+                from agent_spatial_toolkit.pipeline.intrinsics import (
+                    resolve_fallback_intrinsics,
                 )
+
+                intr_obj = resolve_fallback_intrinsics(24.0, image_size)
+                if intr_obj is None:
+                    return (
+                        jsonify(
+                            {
+                                "error": (
+                                    "could not derive camera intrinsics; "
+                                    "provide an explicit intrinsics dict"
+                                )
+                            }
+                        ),
+                        400,
+                    )
+
+            # Fallback paths all raise the estimation flag (the schema's
+            # intrinsics_estimated, schema-merged in PR-1).
+            existing = list(mem.get("flags", []))
+            if "intrinsics_estimated" not in existing:
+                existing.append("intrinsics_estimated")
+                mem["flags"] = existing
+
             intrinsics = intr_obj
             intrinsics_dict = intr_obj.to_dict()
 

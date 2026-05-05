@@ -193,6 +193,14 @@ class Feature:
 
 @dataclass
 class Part:
+    """Identity and human-readable description of the captured assembly.
+
+    The redesigned wizard's "project name" input (design §2 step 1 —
+    "What are you capturing?") populates `display_name`. Do NOT add a
+    separate `project_name` field; the mapping is intentional and the
+    wizard wires its first-screen text input directly to this field.
+    """
+
     id: str
     display_name: str | None = None
     part_class: str | None = None

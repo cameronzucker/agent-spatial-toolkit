@@ -586,6 +586,92 @@ def test_finalize_auto_emits_feature_clicked_only_once(app_factory) -> None:
     assert "feature_clicked_only_once:f1" in flags
 
 
+def test_finalize_emits_triangulated_feature_with_correct_method_and_clicks(app_factory) -> None:
+    """A feature created via 2-view triangulation must emit annotations.json
+    with method=triangulation_2_views, populated per_photo_clicks (each with
+    reprojection_residual_px), and triangulation_rms_px / max_residual_px.
+
+    PR-3 introduced real triangulation in /api/feature; this regression test
+    closes the integration gap that the final pre-push review caught:
+    post_finalize was emitting all features as planar_intersection.
+    """
+    import cv2 as _cv2
+
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    # Two poses for the same world points.
+    payload1 = _valid_anchors_payload()
+    payload1["photo_id"] = "v1"
+    r1 = client.post("/api/anchors", json=payload1)
+    assert r1.status_code == 200, r1.get_json()
+
+    K = np.array([[1000.0, 0, 500.0], [0, 1000.0, 500.0], [0, 0, 1]], dtype=np.float64)  # noqa: N806
+    rvec2 = np.array([0.0, 0.3, 0.0])
+    tvec2 = np.array([-60.0, -15.0, 200.0])
+    world_pts = np.array([[0.0, 0.0, 0.0], [50.0, 0.0, 0.0], [50.0, 30.0, 0.0], [0.0, 30.0, 0.0]])
+    pixels2, _ = _cv2.projectPoints(world_pts, rvec2, tvec2, K, np.zeros(5))
+    payload2 = {
+        "photo_id": "v2",
+        "intrinsics": _make_test_intrinsics_dict(1000, 1000),
+        "image_size": [1000, 1000],
+        "anchors": [
+            {
+                "id": f"a{i}",
+                "pcb_xyz_mm": world_pts[i].tolist(),
+                "pixel": pixels2.reshape(-1, 2)[i].tolist(),
+            }
+            for i in range(4)
+        ],
+    }
+    r2 = client.post("/api/anchors", json=payload2)
+    assert r2.status_code == 200
+
+    target = np.array([15.0, 10.0, 0.0])
+    p1, _ = _cv2.projectPoints(
+        target.reshape(1, 1, 3),
+        np.zeros(3),
+        np.array([-25.0, -15.0, 200.0]),
+        K,
+        np.zeros(5),
+    )
+    p2, _ = _cv2.projectPoints(target.reshape(1, 1, 3), rvec2, tvec2, K, np.zeros(5))
+
+    feat_resp = client.post(
+        "/api/feature",
+        json={
+            "feature_id": "f_tri",
+            "clicks": [
+                {"photo_id": "v1", "pixel": p1.reshape(2).tolist()},
+                {"photo_id": "v2", "pixel": p2.reshape(2).tolist()},
+            ],
+        },
+    )
+    assert feat_resp.status_code == 200, feat_resp.get_json()
+
+    fin = client.post("/api/finalize", json={})
+    assert fin.status_code == 200, fin.get_json()
+    out_path = Path(fin.get_json()["annotations_path"])
+    annotations = json.loads(out_path.read_text(encoding="utf-8"))
+
+    features_emitted = annotations["features"]
+    assert len(features_emitted) == 1
+    feat = features_emitted[0]
+    assert feat["id"] == "f_tri"
+    assert feat["measurements"]["method"] == "triangulation_2_views"
+    # per_photo_clicks must contain BOTH views, each with reprojection_residual_px.
+    clicks = feat["measurements"]["per_photo_clicks"]
+    assert len(clicks) == 2
+    photo_ids = sorted(c["photo"] for c in clicks)
+    assert photo_ids == ["v1", "v2"]
+    for c in clicks:
+        assert "reprojection_residual_px" in c
+    assert "triangulation_rms_px" in feat["measurements"]
+    assert "max_residual_px" in feat["measurements"]
+    # visible_in must list both photos
+    assert sorted(feat["visible_in"]) == ["v1", "v2"]
+
+
 def test_finalize_updates_state_json_status_done(app_factory) -> None:
     """Per spec line 239, state.json is replaced on each event; finalize updates it."""
     app, session, _ = app_factory()

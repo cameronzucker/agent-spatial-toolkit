@@ -1344,24 +1344,55 @@ def _register_routes(app: Flask) -> None:
 
         features_out: list[Feature] = []
         for feature_id, entry in mem["features"].items():
-            features_out.append(
-                Feature(
-                    id=feature_id,
-                    visible_in=[entry["photo_id"]],
-                    pcb_xyz_mm=tuple(entry["pcb_xyz_mm"]),
-                    measurements=FeatureMeasurement(
-                        method="planar_intersection",
-                        z_assumed_mm=entry.get("z_assumed_mm", 0.0),
-                        z_assumed_reason="single_photo_only_default",
-                        per_photo_clicks=[
-                            FeatureClick(
-                                photo=entry["photo_id"],
-                                pixel=tuple(entry["pixel"]),
-                            )
-                        ],
-                    ),
+            entry_method = entry.get("method", "")
+            if entry_method.startswith("triangulation_"):
+                # Multi-view triangulated feature (Task 2 / PR-3 marquee path).
+                # The feature was stored with a clicks list — each click
+                # carrying its own reprojection_residual_px — plus session-
+                # level triangulation_rms_px / max_residual_px. Emit the
+                # full multi-view shape; visible_in lists every click's
+                # photo_id, NOT just the primary.
+                clicks_entries = entry.get("clicks", [])
+                features_out.append(
+                    Feature(
+                        id=feature_id,
+                        visible_in=[c["photo_id"] for c in clicks_entries],
+                        pcb_xyz_mm=tuple(entry["pcb_xyz_mm"]),
+                        measurements=FeatureMeasurement(
+                            method=entry_method,  # type: ignore[arg-type]
+                            triangulation_rms_px=entry["triangulation_rms_px"],
+                            max_residual_px=entry["max_residual_px"],
+                            per_photo_clicks=[
+                                FeatureClick(
+                                    photo=c["photo_id"],
+                                    pixel=tuple(c["pixel"]),
+                                    reprojection_residual_px=c["reprojection_residual_px"],
+                                )
+                                for c in clicks_entries
+                            ],
+                        ),
+                    )
                 )
-            )
+            else:
+                # Single-view planar_intersection (legacy ray-cast path).
+                features_out.append(
+                    Feature(
+                        id=feature_id,
+                        visible_in=[entry["photo_id"]],
+                        pcb_xyz_mm=tuple(entry["pcb_xyz_mm"]),
+                        measurements=FeatureMeasurement(
+                            method="planar_intersection",
+                            z_assumed_mm=entry.get("z_assumed_mm", 0.0),
+                            z_assumed_reason="single_photo_only_default",
+                            per_photo_clicks=[
+                                FeatureClick(
+                                    photo=entry["photo_id"],
+                                    pixel=tuple(entry["pixel"]),
+                                )
+                            ],
+                        ),
+                    )
+                )
 
         state = SessionState(
             part_id=session.part_id,

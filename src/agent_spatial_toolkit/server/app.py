@@ -31,6 +31,8 @@ Design notes
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import math
 import threading
@@ -287,6 +289,22 @@ def create_app(server: _ShutdownableServer, session: Session) -> Flask:
         "flags": [],
     }
 
+    # Short-circuit oversize bodies at the WSGI layer rather than reading the
+    # full payload into memory before checking. The /api/photo route also
+    # has its own 413 check as defense-in-depth (some clients use chunked
+    # transfer-encoding without Content-Length, which bypasses this gate).
+    app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
+
+    @app.errorhandler(413)
+    def _too_large(_e: Any) -> Any:
+        """Friendly 413 message; matches the in-route check's wording."""
+        return (
+            jsonify(
+                {"error": "This photo is unusually large (>50 MB) — reshoot at lower resolution."}
+            ),
+            413,
+        )
+
     _register_routes(app)
     return app
 
@@ -322,6 +340,107 @@ def _register_routes(app: Flask) -> None:
         session: Session = app.config["SESSION"]
         mem: dict[str, Any] = app.config["STATE"]
         return jsonify(_state_snapshot(session, mem))
+
+    @app.post("/api/photo")
+    def post_photo() -> Any:
+        """Upload a photo to the session (design §3 photo lifecycle).
+
+        Accepts JPEG, PNG, HEIC, HEIF. HEIC/HEIF is transparently decoded
+        to JPEG via pillow-heif so iPhone users never see a format error.
+        Photo ID is content-derived (``photo_<sha256[:12]>``) so re-upload
+        of the same content is idempotent. Persists JPEG to
+        ``<session>/photos/<photo_id>.jpg`` via the atomic tmp+rename
+        pattern.
+        """
+        # Lazy import — keeps create_app() startup fast and avoids
+        # paying the pillow-heif import cost on servers that never see
+        # an HEIC upload.
+        import pillow_heif
+        from PIL import Image
+
+        # 50 MB cap; phone shots rarely exceed 30 MB even at max-res HEIF.
+        max_bytes = 50 * 1024 * 1024
+
+        content_type = (request.content_type or "").lower().split(";")[0].strip()
+        if content_type not in {"image/jpeg", "image/png", "image/heic", "image/heif"}:
+            return (
+                jsonify(
+                    {"error": ("Please use JPEG, PNG, or HEIC. Most phones export one of these.")}
+                ),
+                415,
+            )
+
+        body = request.get_data(cache=False)
+        if len(body) > max_bytes:
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            "This photo is unusually large (>50 MB) — reshoot at lower resolution."
+                        )
+                    }
+                ),
+                413,
+            )
+
+        sha256 = hashlib.sha256(body).hexdigest()
+        photo_id = f"photo_{sha256[:12]}"
+
+        # Decode then re-encode as JPEG for consistent on-disk format.
+        # register_heif_opener() is idempotent so calling it on every
+        # HEIC/HEIF request is safe.
+        if content_type in {"image/heic", "image/heif"}:
+            pillow_heif.register_heif_opener()
+        try:
+            img = Image.open(io.BytesIO(body))
+            img.load()  # force decode now so failures surface here, not later
+        except Exception as e:
+            return jsonify({"error": f"could not decode image: {e}"}), 400
+
+        # JPEG can't encode RGBA / palette modes — convert. HEIC and PNG
+        # frequently arrive with alpha or non-RGB modes.
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+
+        session: Session = app.config["SESSION"]
+        photos_dir = session.session_dir / "photos"
+        photo_path = photos_dir / f"{photo_id}.jpg"
+        # Atomic write: write to .jpg.tmp then rename. Mirrors the precedent
+        # set in session.py / emit.py / app.py finalize.
+        tmp_path = photo_path.with_suffix(".jpg.tmp")
+        img.save(tmp_path, format="JPEG", quality=95)
+        tmp_path.replace(photo_path)
+
+        # Update in-memory state. Idempotent: re-upload of the same content
+        # produces the same photo_id, so we keep the existing record.
+        mem: dict[str, Any] = app.config["STATE"]
+        if photo_id not in mem["photos"]:
+            mem["photos"][photo_id] = {
+                "id": photo_id,
+                "path": str(photo_path),
+                "sha256": sha256,
+                "intrinsics": None,  # populated when /api/reference (or /api/anchors) runs
+                "pose": None,
+                "anchors": [],
+            }
+
+        event_log: EventLog = app.config["EVENT_LOG"]
+        event_log.write(
+            {
+                "type": "photo_uploaded",
+                "photo_id": photo_id,
+                "sha256": sha256,
+                "source_format": content_type,
+            }
+        )
+
+        return jsonify(
+            {
+                "photo_id": photo_id,
+                "sha256": sha256,
+                "stored_format": "jpeg",
+            }
+        )
 
     @app.get("/api/lens_catalog")
     def get_lens_catalog() -> Any:
@@ -444,6 +563,169 @@ def _register_routes(app: Flask) -> None:
             }
         )
 
+    @app.post("/api/reference")
+    def post_reference() -> Any:
+        """Confirm scale via the wizard's 4-corner reference-object flow.
+
+        Design §2 step 4. Replaces the legacy ``/api/anchors`` path for the
+        redesigned wizard. Same ``cv2.solvePnP`` machinery, but the 4 world
+        points are derived from a known-dimensions reference type (credit
+        card, dollar bill, marker) rather than typed by the user.
+
+        The client POSTs ``{photo_id, reference_type, pixel_corners,
+        image_size}`` plus either an explicit ``intrinsics`` dict or a
+        ``lens_id`` (transitional; PR-3 adds full EXIF-auto + FOV-class
+        fallback). ``pixel_corners`` MUST be a list of exactly 4 ``[x, y]``
+        entries in clockwise-from-top-left order, index-aligned with the
+        world corners returned by ``get_corner_positions_mm``.
+        """
+        from agent_spatial_toolkit.server.reference_objects import (
+            ReferenceObjectError,
+            get_corner_positions_mm,
+        )
+
+        event_log: EventLog = app.config["EVENT_LOG"]
+        mem: dict[str, Any] = app.config["STATE"]
+
+        body = request.get_json(silent=True) or {}
+        try:
+            photo_id = body["photo_id"]
+            reference_type = body["reference_type"]
+            pixel_corners_in = body["pixel_corners"]
+            image_size_in = body["image_size"]
+        except (KeyError, TypeError):
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            "missing required field "
+                            "(photo_id, reference_type, pixel_corners, image_size)"
+                        )
+                    }
+                ),
+                400,
+            )
+
+        if not isinstance(pixel_corners_in, list) or len(pixel_corners_in) != 4:
+            return (
+                jsonify({"error": "pixel_corners must be an array of exactly 4 [x, y] entries"}),
+                400,
+            )
+
+        if not isinstance(image_size_in, list) or len(image_size_in) != 2:
+            return jsonify({"error": "image_size must be [width, height]"}), 400
+
+        try:
+            world_corners = get_corner_positions_mm(reference_type)
+        except ReferenceObjectError as e:
+            return jsonify({"error": str(e)}), 400
+
+        try:
+            image_size = (
+                _coerce_finite_int(image_size_in[0], "image_size[0]"),
+                _coerce_finite_int(image_size_in[1], "image_size[1]"),
+            )
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+
+        # Reuse intrinsics-resolution from /api/anchors (transitional;
+        # PR-3 adds full EXIF-auto + FOV-class fallback).
+        intrinsics_dict = body.get("intrinsics")
+        if intrinsics_dict is not None:
+            try:
+                intrinsics = _intrinsics_from_dict(intrinsics_dict)
+            except (KeyError, TypeError, ValueError) as e:
+                return jsonify({"error": f"invalid intrinsics: {e}"}), 400
+        else:
+            lens_id = body.get("lens_id")
+            if not lens_id:
+                return (
+                    jsonify({"error": "must provide either intrinsics or lens_id"}),
+                    400,
+                )
+            from agent_spatial_toolkit.server.lens_catalog import resolve as _resolve_lens
+
+            intr_obj = _resolve_lens(lens_id, image_size, exif=body.get("exif"))
+            if intr_obj is None:
+                return (
+                    jsonify(
+                        {
+                            "error": (
+                                f"lens_id '{lens_id}' could not resolve to intrinsics; "
+                                "provide an explicit intrinsics dict"
+                            )
+                        }
+                    ),
+                    400,
+                )
+            intrinsics = intr_obj
+            intrinsics_dict = intr_obj.to_dict()
+
+        try:
+            world_points = np.array(world_corners, dtype=np.float64)
+            pixel_points = np.array(pixel_corners_in, dtype=np.float64)
+            if pixel_points.shape != (4, 2):
+                raise ValueError("each pixel_corner must be [x, y]")
+        except (ValueError, TypeError) as e:
+            return jsonify({"error": f"invalid pixel_corners: {e}"}), 400
+
+        try:
+            pose = solve_pnp(world_points, pixel_points, intrinsics, image_size)
+        except PoseSolveError as e:
+            event_log.write(
+                {
+                    "type": "pose_failed",
+                    "photo_id": photo_id,
+                    "reference_type": reference_type,
+                    "error_detail": str(e),
+                }
+            )
+            return (
+                jsonify(
+                    {"error": ("pose solve failed: corners may be too oblique or mis-clicked")}
+                ),
+                400,
+            )
+        except Exception:
+            return jsonify({"error": "internal error during pose solve"}), 500
+
+        # Update in-memory state. Matches the photo-record shape established
+        # by /api/photo (Task 3): photo entry exists from upload, this route
+        # populates intrinsics + pose + reference fields. setdefault keeps
+        # the route safe even if the client somehow skipped /api/photo.
+        mem.setdefault("photos", {})
+        photo_record = mem["photos"].setdefault(
+            photo_id,
+            {
+                "id": photo_id,
+                "intrinsics": None,
+                "pose": None,
+                "anchors": [],
+            },
+        )
+        photo_record["intrinsics"] = intrinsics_dict
+        photo_record["pose"] = pose
+        photo_record["image_size"] = image_size
+        photo_record["reference_type"] = reference_type
+        photo_record["pixel_corners"] = pixel_corners_in
+
+        event_log.write(
+            {
+                "type": "reference_solved",
+                "photo_id": photo_id,
+                "reference_type": reference_type,
+                "anchor_reprojection_rms_px": pose.anchor_reprojection_rms_px,
+                "intrinsics_suspect": pose.intrinsics_suspect,
+            }
+        )
+
+        return jsonify(
+            {
+                "pose": pose.to_dict(),
+                "intrinsics_suspect": pose.intrinsics_suspect,
+            }
+        )
+
     @app.post("/api/feature")
     def post_feature() -> Any:
         event_log: EventLog = app.config["EVENT_LOG"]
@@ -462,12 +744,54 @@ def _register_routes(app: Flask) -> None:
                 501,
             )
 
-        try:
-            feature_id = body["feature_id"]
-            photo_id = body["photo_id"]
-            pixel_in = body["pixel"]
-        except (KeyError, TypeError):
-            return jsonify({"error": "missing required field (feature_id, photo_id, pixel)"}), 400
+        # Wizard-redesign (PR-2 Task 5): the new request shape carries a
+        # ``clicks`` list of ``{photo_id, pixel}`` entries.
+        #   - len == 1  → unwrap into the existing single-view ray-cast path.
+        #   - len >= 2  → triangulation, deferred to PR-3 (HTTP 501 stub).
+        #   - len == 0  → 400.
+        # The legacy shape (top-level photo_id + pixel, no ``clicks`` key)
+        # is preserved during the transition until PR-4 migrates UI callers.
+        if "clicks" in body:
+            clicks = body["clicks"]
+            if not isinstance(clicks, list):
+                return jsonify({"error": "clicks must be an array"}), 400
+            if len(clicks) == 0:
+                return jsonify({"error": "clicks must contain at least one entry"}), 400
+            if len(clicks) >= 2:
+                return (
+                    jsonify(
+                        {
+                            "error": "triangulation not yet implemented; arrives in PR-3",
+                            "n_clicks_received": len(clicks),
+                        }
+                    ),
+                    501,
+                )
+            # Single-click case: unwrap clicks[0] into the legacy fields the
+            # existing ray-cast logic below already understands.
+            try:
+                feature_id = body["feature_id"]
+                first_click = clicks[0]
+                photo_id = first_click["photo_id"]
+                pixel_in = first_click["pixel"]
+            except (KeyError, TypeError):
+                return (
+                    jsonify(
+                        {
+                            "error": "missing required field (feature_id, clicks[0].photo_id, clicks[0].pixel)"
+                        }
+                    ),
+                    400,
+                )
+        else:
+            try:
+                feature_id = body["feature_id"]
+                photo_id = body["photo_id"]
+                pixel_in = body["pixel"]
+            except (KeyError, TypeError):
+                return jsonify(
+                    {"error": "missing required field (feature_id, photo_id, pixel)"}
+                ), 400
 
         try:
             z_assumed_mm = _coerce_finite_float(body.get("z_assumed_mm", 0.0), "z_assumed_mm")
@@ -479,6 +803,15 @@ def _register_routes(app: Flask) -> None:
             return jsonify(
                 {"error": f"photo '{photo_id}' has no pose; call /api/anchors first"}
             ), 404
+        # Match the wireframe handler's guard (app.py ~1076): an upload-only
+        # photo (created via /api/photo without a subsequent /api/reference
+        # or /api/anchors call) has a photo entry but no pose/intrinsics yet.
+        # Without this check, _intrinsics_from_dict(None) raises TypeError
+        # which the surrounding except returns as 500 "stored intrinsics are
+        # malformed" — wrong status, wrong message. Return 404 like the
+        # legacy contract for "no pose for this photo yet".
+        if photo_entry.get("pose") is None or photo_entry.get("intrinsics") is None:
+            return jsonify({"error": f"no pose for photo {photo_id}"}), 404
 
         try:
             intrinsics = _intrinsics_from_dict(photo_entry["intrinsics"])
@@ -519,6 +852,41 @@ def _register_routes(app: Flask) -> None:
         )
 
         return jsonify({"pcb_xyz_mm": pcb_xyz})
+
+    # ─────────────────────────────────────────────────────────────────
+    # Stub endpoints: contract surface for the redesigned wizard. Real
+    # logic for these arrives in PR-3; PR-2 ships the shapes only so
+    # the UI (PR-4) and PR-3's wiring can land independently.
+    # ─────────────────────────────────────────────────────────────────
+
+    @app.get("/api/marker_detect/<path:photo_id>")
+    def get_marker_detect(photo_id: str) -> Any:
+        """Stub: real cv2.aruco.detectMarkers wiring lands in PR-3."""
+        return jsonify({"corners": None})
+
+    @app.get("/api/next_prompt")
+    def get_next_prompt() -> Any:
+        """Stub: returns typed shape with placeholder values; real
+        scoring algorithm (design §4) lands in PR-3."""
+        return jsonify(
+            {
+                "direction": "+long",
+                "reason": "Server scoring not yet implemented (PR-3)",
+                "coverage_cells": {
+                    "top": False,
+                    "+long": False,
+                    "-long": False,
+                    "+short": False,
+                    "-short": False,
+                },
+                "features": [],
+            }
+        )
+
+    @app.get("/api/reproject_all")
+    def get_reproject_all() -> Any:
+        """Stub: PR-3 wires per-feature reprojection error in mm."""
+        return jsonify({"features": []})
 
     @app.post("/api/finalize")
     def post_finalize() -> Any:
@@ -707,6 +1075,14 @@ def _register_routes(app: Flask) -> None:
         mem: dict[str, Any] = app.config["STATE"]
         photo_state = mem["photos"].get(safe_id)
         if photo_state is None:
+            return jsonify({"error": f"no pose for photo {safe_id}"}), 404
+        # /api/photo (PR-2 Task 3) creates a photo entry before any pose is
+        # solved (intrinsics=None, pose=None). The wireframe endpoint
+        # pre-dates that flow and historically assumed photo_state was only
+        # populated post-anchors. Without this check, GET /api/wireframe
+        # for an upload-only photo returns 500 (NoneType subscript). 404 is
+        # the correct legacy contract: "no pose for this photo yet".
+        if photo_state.get("pose") is None or photo_state.get("intrinsics") is None:
             return jsonify({"error": f"no pose for photo {safe_id}"}), 404
 
         # Locate the source photo file (id may be the basename without extension

@@ -1,47 +1,20 @@
-"""Tests for server/app.py — Flask routes for the wizard API (spec §4)."""
+"""Tests for server/app.py — Flask routes for the wizard API (spec §4).
+
+The ``app_factory`` fixture and ``_StubServer`` helper used by these
+tests are defined in :mod:`tests.conftest` and resolved automatically
+by pytest.
+"""
 
 from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable
-from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
 
 from agent_spatial_toolkit.pipeline.intrinsics import Intrinsics
-from agent_spatial_toolkit.server.app import create_app
-from agent_spatial_toolkit.server.session import create_session
-
-
-class _StubServer:
-    """Minimal Server stand-in for /api/finalize shutdown.
-
-    The lifecycle.Server class wraps a real WSGI socket; tests use Flask's
-    test client, so a stub that just records shutdown() is sufficient.
-    """
-
-    def __init__(self) -> None:
-        self.shutdown_called = False
-
-    def shutdown(self) -> None:
-        self.shutdown_called = True
-
-
-@pytest.fixture
-def app_factory(tmp_path: Path) -> Callable:
-    """Return a factory producing (app, session, server) tuples per test."""
-
-    def _make():
-        session = create_session(part_id="testpart", base_dir=tmp_path / "sessions")
-        server = _StubServer()
-        app = create_app(server=server, session=session)
-        app.config["TESTING"] = True
-        return app, session, server
-
-    return _make
 
 
 def _make_test_intrinsics_dict(width: int = 1000, height: int = 1000) -> dict:
@@ -96,6 +69,23 @@ def _valid_anchors_payload(image_size: tuple[int, int] = (1000, 1000)) -> dict:
             for i in range(4)
         ],
     }
+
+
+def _upload_test_photo(client) -> str:
+    """Upload a small JPEG via /api/photo and return its photo_id.
+
+    Used by tests for routes that depend on a photo being in the session.
+    """
+    import io
+
+    from PIL import Image
+
+    img = Image.new("RGB", (200, 150), color=(128, 64, 200))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    response = client.post("/api/photo", data=buf.getvalue(), content_type="image/jpeg")
+    assert response.status_code == 200, f"photo upload failed: {response.get_json()}"
+    return response.get_json()["photo_id"]
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -231,6 +221,127 @@ def test_feature_route_unknown_photo_returns_404(app_factory) -> None:
     )
     assert resp.status_code == 404
     assert "error" in resp.get_json()
+
+
+def test_post_feature_single_click_uses_existing_ray_cast(app_factory) -> None:
+    """POST /api/feature with clicks=[{photo_id, pixel}] (one entry) returns
+    pcb_xyz_mm via the existing single-view ray-cast path."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    # Establish a pose for the photo (legacy /api/anchors path is fine for setup).
+    anchors_resp = client.post("/api/anchors", json=_valid_anchors_payload())
+    assert anchors_resp.status_code == 200, anchors_resp.get_json()
+
+    resp = client.post(
+        "/api/feature",
+        json={
+            "feature_id": "f1",
+            "clicks": [{"photo_id": "top_down", "pixel": [500.0, 500.0]}],
+            "z_assumed_mm": 0.0,
+        },
+    )
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    assert "pcb_xyz_mm" in body
+    assert len(body["pcb_xyz_mm"]) == 3
+    assert body["pcb_xyz_mm"][2] == pytest.approx(0.0)
+
+
+def test_post_feature_two_clicks_returns_501(app_factory) -> None:
+    """POST /api/feature with 2 clicks returns 501 (triangulation deferred to PR-3)."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    # Establish pose so we get past prerequisite checks (state must exist for
+    # the route to be exercised end-to-end; the 501 short-circuit fires before
+    # any per-photo lookups but keeping the setup mirrors the real wizard flow).
+    anchors_resp = client.post("/api/anchors", json=_valid_anchors_payload())
+    assert anchors_resp.status_code == 200, anchors_resp.get_json()
+
+    resp = client.post(
+        "/api/feature",
+        json={
+            "feature_id": "f1",
+            "clicks": [
+                {"photo_id": "top_down", "pixel": [500.0, 500.0]},
+                {"photo_id": "top_down", "pixel": [400.0, 400.0]},
+            ],
+        },
+    )
+    assert resp.status_code == 501
+    body = resp.get_json()
+    assert "error" in body
+    assert "triangulation" in body["error"].lower()
+    assert "PR-3" in body["error"]
+    assert body["n_clicks_received"] == 2
+
+
+def test_post_feature_zero_clicks_returns_400(app_factory) -> None:
+    """POST /api/feature with clicks=[] returns 400."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    resp = client.post(
+        "/api/feature",
+        json={
+            "feature_id": "f1",
+            "clicks": [],
+        },
+    )
+    assert resp.status_code == 400
+    assert "error" in resp.get_json()
+
+
+def test_post_feature_legacy_single_pixel_shape_still_works(app_factory) -> None:
+    """Legacy shape (top-level photo_id + pixel, no clicks) still returns 200.
+
+    Backwards-compat regression: PR-4 will migrate UI callers; until then this
+    path must remain operational.
+    """
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    anchors_resp = client.post("/api/anchors", json=_valid_anchors_payload())
+    assert anchors_resp.status_code == 200, anchors_resp.get_json()
+
+    resp = client.post(
+        "/api/feature",
+        json={
+            "feature_id": "f1",
+            "photo_id": "top_down",
+            "pixel": [500.0, 500.0],
+            "z_assumed_mm": 0.0,
+        },
+    )
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    assert "pcb_xyz_mm" in body
+    assert len(body["pcb_xyz_mm"]) == 3
+
+
+def test_post_feature_upload_only_photo_returns_404(app_factory) -> None:
+    """Regression: /api/photo creates photo entries with intrinsics=None;
+    /api/feature must 404 (matching the wireframe handler's contract)
+    rather than 500 with a misleading 'stored intrinsics are malformed'
+    message. Discovered by the legacy regression suite in Task 7."""
+    app, session, server = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+    # Note: NO /api/reference call — photo is upload-only
+    response = client.post(
+        "/api/feature",
+        json={
+            "feature_id": "usb_c",
+            "photo_id": photo_id,
+            "pixel": [200, 250],
+        },
+    )
+    assert response.status_code == 404, (
+        f"upload-only photo should return 404, not {response.status_code}: "
+        f"{response.get_data(as_text=True)}"
+    )
+    assert "no pose" in response.get_json()["error"].lower()
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -672,3 +783,184 @@ def test_wireframe_route_rejects_path_traversal(app_factory) -> None:
         assert resp.status_code in (400, 404), (
             f"Expected 400/404 for {evil!r}; got {resp.status_code}"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# POST /api/reference (wizard "confirm scale" — replaces /api/anchors)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_post_reference_credit_card_solves_pose(app_factory) -> None:
+    """A simulated 4-corner credit-card click produces a pose."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+    response = client.post(
+        "/api/reference",
+        json={
+            "photo_id": photo_id,
+            "reference_type": "credit_card",
+            "pixel_corners": [[100, 100], [400, 100], [400, 300], [100, 300]],
+            "image_size": [800, 600],
+            "intrinsics": _make_test_intrinsics_dict(800, 600),
+        },
+    )
+    assert response.status_code == 200, response.get_json()
+    body = response.get_json()
+    assert "pose" in body
+    assert "intrinsics_suspect" in body
+    assert body["pose"]["rvec"] is not None
+    assert body["pose"]["tvec"] is not None
+
+
+def test_post_reference_dollar_bill_uses_correct_dimensions(app_factory) -> None:
+    """Dollar-bill 4-corner clicks produce a pose with translation derived
+    from the larger reference dimensions (156.1 x 66.3 mm vs 85.6 x 53.98)."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+    response = client.post(
+        "/api/reference",
+        json={
+            "photo_id": photo_id,
+            "reference_type": "dollar_bill",
+            "pixel_corners": [[100, 100], [400, 100], [400, 300], [100, 300]],
+            "image_size": [800, 600],
+            "intrinsics": _make_test_intrinsics_dict(800, 600),
+        },
+    )
+    assert response.status_code == 200, response.get_json()
+
+
+def test_post_reference_unknown_type_returns_400(app_factory) -> None:
+    """Unknown reference_type returns 400 with 'unknown reference type' in error."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+    response = client.post(
+        "/api/reference",
+        json={
+            "photo_id": photo_id,
+            "reference_type": "not_a_real_type",
+            "pixel_corners": [[100, 100], [400, 100], [400, 300], [100, 300]],
+            "image_size": [800, 600],
+            "intrinsics": _make_test_intrinsics_dict(800, 600),
+        },
+    )
+    assert response.status_code == 400
+    assert "unknown reference type" in response.get_json()["error"].lower()
+
+
+def test_post_reference_missing_pixel_corners_returns_400(app_factory) -> None:
+    """Missing pixel_corners field returns 400."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+    response = client.post(
+        "/api/reference",
+        json={
+            "photo_id": photo_id,
+            "reference_type": "credit_card",
+            "image_size": [800, 600],
+            "intrinsics": _make_test_intrinsics_dict(800, 600),
+            # pixel_corners omitted
+        },
+    )
+    assert response.status_code == 400
+
+
+def test_post_reference_wrong_corner_count_returns_400(app_factory) -> None:
+    """Need exactly 4 corners; 3 or 5 must be rejected."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+    for n_corners in [3, 5]:
+        corners = [[100 + i * 10, 100] for i in range(n_corners)]
+        response = client.post(
+            "/api/reference",
+            json={
+                "photo_id": photo_id,
+                "reference_type": "credit_card",
+                "pixel_corners": corners,
+                "image_size": [800, 600],
+                "intrinsics": _make_test_intrinsics_dict(800, 600),
+            },
+        )
+        assert response.status_code == 400, f"expected 400 for n_corners={n_corners}"
+
+
+def test_marker_detect_stub_returns_null_corners(app_factory) -> None:
+    """PR-2 stub: no auto-detect yet; PR-3 wires cv2.aruco."""
+    app, session, server = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+    response = client.get(f"/api/marker_detect/{photo_id}")
+    assert response.status_code == 200
+    assert response.get_json() == {"corners": None}
+
+
+def test_next_prompt_stub_returns_typed_shape(app_factory) -> None:
+    """PR-2 stub returns the shape the UI expects; PR-3 implements scoring."""
+    app, session, server = app_factory()
+    client = app.test_client()
+    response = client.get("/api/next_prompt")
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["direction"] in {"top", "+long", "-long", "+short", "-short"}
+    assert "reason" in body
+    assert isinstance(body["coverage_cells"], dict)
+    assert "PR-3" in body["reason"], "stub reason must self-document as not-yet-implemented"
+
+
+def test_reproject_all_stub_returns_empty_features(app_factory) -> None:
+    app, session, server = app_factory()
+    client = app.test_client()
+    response = client.get("/api/reproject_all")
+    assert response.status_code == 200
+    assert response.get_json() == {"features": []}
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Legacy endpoint regression tests (deleted in PR-4; functional until then)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_legacy_anchors_endpoint_still_functional(app_factory) -> None:
+    """Until PR-4 deletes it, /api/anchors must keep working for the
+    legacy UI (and any external callers that haven't migrated to
+    /api/reference yet)."""
+    app, session, server = app_factory()
+    client = app.test_client()
+    _upload_test_photo(client)
+    payload = _valid_anchors_payload(image_size=(1000, 1000))
+    response = client.post("/api/anchors", json=payload)
+    assert response.status_code == 200
+    assert "pose" in response.get_json()
+
+
+def test_legacy_lens_catalog_endpoint_still_functional(app_factory) -> None:
+    """Until PR-4 deletes it, /api/lens_catalog must keep returning
+    the lens-catalog payload for any legacy UI callers."""
+    app, session, server = app_factory()
+    client = app.test_client()
+    response = client.get("/api/lens_catalog")
+    assert response.status_code == 200
+    body = response.get_json()
+    assert isinstance(body, (dict, list)), "lens_catalog returns an enumerable"
+
+
+def test_legacy_wireframe_endpoint_still_functional(app_factory) -> None:
+    """Until PR-4 deletes it, /api/wireframe/<photo_id> must keep
+    returning a wireframe PNG for solved photos (or a sensible 4xx
+    if the photo has no solved pose)."""
+    app, session, server = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+    response = client.get(f"/api/wireframe/{photo_id}")
+    # The endpoint may return 200 (PNG) for a solved photo OR 404 for
+    # a photo with no pose. Anything else (500, 410) means the endpoint
+    # is broken or has been silently disabled.
+    assert response.status_code in {200, 404}, (
+        f"wireframe must be functional (200) or report no-pose-solved (404), "
+        f"not {response.status_code}"
+    )

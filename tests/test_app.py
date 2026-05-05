@@ -969,6 +969,46 @@ def test_post_reference_wrong_corner_count_returns_400(app_factory) -> None:
         assert response.status_code == 400, f"expected 400 for n_corners={n_corners}"
 
 
+def test_post_reference_returns_pose_rms_mm(app_factory) -> None:
+    """The /api/reference response now carries pose_rms_mm so the UI
+    tier-badge logic can render Excellent/Good/Approximate/Try again."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+
+    # Project credit-card corners through a known pose to get pixel corners.
+    import cv2 as _cv2
+
+    K = np.array([[1000.0, 0, 100.0], [0, 1000.0, 75.0], [0, 0, 1]], dtype=np.float64)  # noqa: N806
+    rvec = np.array([0.0, 0.0, 0.0])
+    tvec = np.array([-42.8, -27.0, 200.0])
+    world_corners = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [85.60, 0.0, 0.0],
+            [85.60, 53.98, 0.0],
+            [0.0, 53.98, 0.0],
+        ]
+    )
+    pixel_corners, _ = _cv2.projectPoints(world_corners, rvec, tvec, K, np.zeros(5))
+    pixel_corners = pixel_corners.reshape(-1, 2).tolist()
+
+    payload = {
+        "photo_id": photo_id,
+        "reference_type": "credit_card",
+        "pixel_corners": pixel_corners,
+        "image_size": [200, 150],
+        "intrinsics": _make_test_intrinsics_dict(200, 150),
+    }
+    resp = client.post("/api/reference", json=payload)
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    assert "pose_rms_mm" in body
+    assert isinstance(body["pose_rms_mm"], float)
+    assert body["pose_rms_mm"] >= 0.0
+    assert body["pose_rms_mm"] < 5.0  # synthetic-clean clicks should be tight
+
+
 def test_marker_detect_stub_returns_null_corners(app_factory) -> None:
     """PR-2 stub: no auto-detect yet; PR-3 wires cv2.aruco."""
     app, session, server = app_factory()

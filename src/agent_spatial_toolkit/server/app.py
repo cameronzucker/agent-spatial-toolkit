@@ -44,6 +44,7 @@ import numpy as np
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
 from agent_spatial_toolkit.pipeline.emit import SessionState, emit_annotations
+from agent_spatial_toolkit.pipeline.error_mm import pose_rms_mm
 from agent_spatial_toolkit.pipeline.intrinsics import Intrinsics
 from agent_spatial_toolkit.pipeline.pose import PoseResult, PoseSolveError, solve_pnp
 from agent_spatial_toolkit.pipeline.ray import pixel_to_part_local
@@ -724,10 +725,16 @@ def _register_routes(app: Flask) -> None:
             }
         )
 
+        rms_mm_value = pose_rms_mm(
+            pose=pose,
+            intrinsics=intrinsics,
+            anchor_rms_px=pose.anchor_reprojection_rms_px,
+        )
         return jsonify(
             {
                 "pose": pose.to_dict(),
                 "intrinsics_suspect": pose.intrinsics_suspect,
+                "pose_rms_mm": rms_mm_value,
             }
         )
 

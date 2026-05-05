@@ -248,33 +248,113 @@ def test_post_feature_single_click_uses_existing_ray_cast(app_factory) -> None:
     assert body["pcb_xyz_mm"][2] == pytest.approx(0.0)
 
 
-def test_post_feature_two_clicks_returns_501(app_factory) -> None:
-    """POST /api/feature with 2 clicks returns 501 (triangulation deferred to PR-3)."""
+def test_post_feature_two_clicks_triangulates_to_known_point(app_factory) -> None:
+    """POST /api/feature with 2 clicks runs real triangulation; returns
+    pcb_xyz_mm + measurements with method=triangulation_2_views."""
     app, _, _ = app_factory()
     client = app.test_client()
 
-    # Establish pose so we get past prerequisite checks (state must exist for
-    # the route to be exercised end-to-end; the 501 short-circuit fires before
-    # any per-photo lookups but keeping the setup mirrors the real wizard flow).
-    anchors_resp = client.post("/api/anchors", json=_valid_anchors_payload())
-    assert anchors_resp.status_code == 200, anchors_resp.get_json()
+    # Establish poses for two photos by re-using the synthetic anchors fixture
+    # twice with different photo_ids.
+    payload1 = _valid_anchors_payload()
+    payload1["photo_id"] = "photo_view_1"
+    r1 = client.post("/api/anchors", json=payload1)
+    assert r1.status_code == 200, r1.get_json()
+
+    payload2 = _valid_anchors_payload()
+    payload2["photo_id"] = "photo_view_2"
+    # Shift the camera in payload2 so the two views are not identical.
+    # The anchor pixels are recomputed by _project_anchors via _valid_anchors_payload;
+    # for this test we need a genuinely different camera angle. Build it manually:
+    import cv2 as _cv2
+
+    world_pts = np.array([[0.0, 0.0, 0.0], [50.0, 0.0, 0.0], [50.0, 30.0, 0.0], [0.0, 30.0, 0.0]])
+    K = np.array([[1000.0, 0, 500.0], [0, 1000.0, 500.0], [0, 0, 1]], dtype=np.float64)  # noqa: N806
+    rvec2 = np.array([0.0, 0.3, 0.0])
+    tvec2 = np.array([-60.0, -15.0, 200.0])
+    pixels2, _ = _cv2.projectPoints(world_pts, rvec2, tvec2, K, np.zeros(5))
+    pixels2 = pixels2.reshape(-1, 2).tolist()
+    payload2["anchors"] = [
+        {"id": f"a{i}", "pcb_xyz_mm": world_pts[i].tolist(), "pixel": pixels2[i]} for i in range(4)
+    ]
+    r2 = client.post("/api/anchors", json=payload2)
+    assert r2.status_code == 200, r2.get_json()
+
+    # Now click the same physical point (15, 10, 0) in both views.
+    target = np.array([15.0, 10.0, 0.0])
+    p1, _ = _cv2.projectPoints(
+        target.reshape(1, 1, 3), np.zeros(3), np.array([-25.0, -15.0, 200.0]), K, np.zeros(5)
+    )
+    p2, _ = _cv2.projectPoints(target.reshape(1, 1, 3), rvec2, tvec2, K, np.zeros(5))
+    pixel1 = p1.reshape(2).tolist()
+    pixel2 = p2.reshape(2).tolist()
 
     resp = client.post(
         "/api/feature",
         json={
-            "feature_id": "f1",
+            "feature_id": "f_triangulated",
             "clicks": [
-                {"photo_id": "top_down", "pixel": [500.0, 500.0]},
-                {"photo_id": "top_down", "pixel": [400.0, 400.0]},
+                {"photo_id": "photo_view_1", "pixel": pixel1},
+                {"photo_id": "photo_view_2", "pixel": pixel2},
             ],
         },
     )
-    assert resp.status_code == 501
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    assert "pcb_xyz_mm" in body
+    assert body["pcb_xyz_mm"][0] == pytest.approx(15.0, abs=0.05)
+    assert body["pcb_xyz_mm"][1] == pytest.approx(10.0, abs=0.05)
+    assert body["pcb_xyz_mm"][2] == pytest.approx(0.0, abs=0.05)
+    assert body["method"] == "triangulation_2_views"
+    assert body["n_views"] == 2
+    assert "triangulation_rms_px" in body
+    assert "max_residual_px" in body
+
+
+def test_post_feature_seven_clicks_returns_400(app_factory) -> None:
+    """v1 caps at 6 views; 7 clicks must return 400 with a clear message."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    # Establish a single pose so the photo lookups don't 404 first.
+    anchors_resp = client.post("/api/anchors", json=_valid_anchors_payload())
+    assert anchors_resp.status_code == 200
+
+    resp = client.post(
+        "/api/feature",
+        json={
+            "feature_id": "f_too_many",
+            "clicks": [{"photo_id": "top_down", "pixel": [500.0, 500.0]} for _ in range(7)],
+        },
+    )
+    assert resp.status_code == 400
     body = resp.get_json()
     assert "error" in body
-    assert "triangulation" in body["error"].lower()
-    assert "PR-3" in body["error"]
-    assert body["n_clicks_received"] == 2
+    assert "6" in body["error"]
+
+
+def test_post_feature_two_clicks_unknown_photo_returns_404(app_factory) -> None:
+    """If any of the multi-view clicks references an unknown photo_id, return 404."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    # Establish one pose; the second photo_id is intentionally absent.
+    anchors_resp = client.post("/api/anchors", json=_valid_anchors_payload())
+    assert anchors_resp.status_code == 200
+
+    resp = client.post(
+        "/api/feature",
+        json={
+            "feature_id": "f_dangling",
+            "clicks": [
+                {"photo_id": "top_down", "pixel": [500.0, 500.0]},
+                {"photo_id": "no_such_photo", "pixel": [400.0, 400.0]},
+            ],
+        },
+    )
+    assert resp.status_code == 404
+    assert "error" in resp.get_json()
+    assert "no_such_photo" in resp.get_json()["error"]
 
 
 def test_post_feature_zero_clicks_returns_400(app_factory) -> None:

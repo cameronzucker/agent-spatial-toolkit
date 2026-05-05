@@ -47,6 +47,11 @@ from agent_spatial_toolkit.pipeline.emit import SessionState, emit_annotations
 from agent_spatial_toolkit.pipeline.intrinsics import Intrinsics
 from agent_spatial_toolkit.pipeline.pose import PoseResult, PoseSolveError, solve_pnp
 from agent_spatial_toolkit.pipeline.ray import pixel_to_part_local
+from agent_spatial_toolkit.pipeline.triangulate import (
+    MAX_VIEWS,
+    TriangulationError,
+    triangulate_feature,
+)
 from agent_spatial_toolkit.schema.models import (
     AnchorClick,
     CameraDetected,
@@ -757,18 +762,117 @@ def _register_routes(app: Flask) -> None:
                 return jsonify({"error": "clicks must be an array"}), 400
             if len(clicks) == 0:
                 return jsonify({"error": "clicks must contain at least one entry"}), 400
-            if len(clicks) >= 2:
+            if len(clicks) > MAX_VIEWS:
                 return (
                     jsonify(
                         {
-                            "error": "triangulation not yet implemented; arrives in PR-3",
-                            "n_clicks_received": len(clicks),
+                            "error": (
+                                f"v1 triangulates from up to {MAX_VIEWS} views; "
+                                f"received {len(clicks)} — please reduce to your "
+                                f"{MAX_VIEWS} best views"
+                            )
                         }
                     ),
-                    501,
+                    400,
                 )
-            # Single-click case: unwrap clicks[0] into the legacy fields the
-            # existing ray-cast logic below already understands.
+            if len(clicks) >= 2:
+                # Multi-view triangulation path. Build (pose, intrinsics, pixel)
+                # triples for each click; any missing photo / pose / intrinsics
+                # is a 404 with the offending photo_id called out.
+                try:
+                    feature_id = body["feature_id"]
+                except (KeyError, TypeError):
+                    return (
+                        jsonify({"error": "missing required field: feature_id"}),
+                        400,
+                    )
+                view_triples: list[Any] = []
+                for i, click in enumerate(clicks):
+                    try:
+                        c_photo_id = click["photo_id"]
+                        c_pixel = click["pixel"]
+                    except (KeyError, TypeError):
+                        return (
+                            jsonify(
+                                {"error": (f"clicks[{i}] missing required field (photo_id, pixel)")}
+                            ),
+                            400,
+                        )
+                    photo_entry = mem["photos"].get(c_photo_id)
+                    if photo_entry is None:
+                        return (
+                            jsonify({"error": f"unknown photo_id '{c_photo_id}' in clicks[{i}]"}),
+                            404,
+                        )
+                    if photo_entry.get("pose") is None or photo_entry.get("intrinsics") is None:
+                        return (
+                            jsonify({"error": f"no pose for photo {c_photo_id}"}),
+                            404,
+                        )
+                    try:
+                        intrinsics_obj = _intrinsics_from_dict(photo_entry["intrinsics"])
+                    except (KeyError, TypeError, ValueError) as e:
+                        return (
+                            jsonify({"error": f"stored intrinsics are malformed: {e}"}),
+                            500,
+                        )
+                    pose_obj: PoseResult = photo_entry["pose"]
+                    try:
+                        pixel_pair = (
+                            _coerce_finite_float(c_pixel[0], f"clicks[{i}].pixel[0]"),
+                            _coerce_finite_float(c_pixel[1], f"clicks[{i}].pixel[1]"),
+                        )
+                    except (TypeError, ValueError, IndexError) as e:
+                        return jsonify({"error": str(e)}), 400
+                    view_triples.append((pose_obj, intrinsics_obj, pixel_pair))
+
+                try:
+                    tri = triangulate_feature(view_triples)
+                except TriangulationError as e:
+                    return jsonify({"error": str(e)}), 400
+
+                method = f"triangulation_{tri.n_views}_views"
+                pcb_xyz = [float(tri.xyz_mm[0]), float(tri.xyz_mm[1]), float(tri.xyz_mm[2])]
+                # Persist with the multi-view shape: clicks list (not single
+                # pixel), method enum reflecting view count, and the residual
+                # metadata for emit.py to surface in quality_summary.
+                mem["features"][feature_id] = {
+                    "photo_id": clicks[0]["photo_id"],  # primary photo for legacy state-shape
+                    "pixel": [float(clicks[0]["pixel"][0]), float(clicks[0]["pixel"][1])],
+                    "pcb_xyz_mm": pcb_xyz,
+                    "method": method,
+                    "clicks": [
+                        {
+                            "photo_id": c["photo_id"],
+                            "pixel": [float(c["pixel"][0]), float(c["pixel"][1])],
+                            "reprojection_residual_px": tri.per_click_residuals_px[i],
+                        }
+                        for i, c in enumerate(clicks)
+                    ],
+                    "triangulation_rms_px": tri.triangulation_rms_px,
+                    "max_residual_px": tri.max_residual_px,
+                }
+                event_log.write(
+                    {
+                        "type": "feature_triangulated",
+                        "feature_id": feature_id,
+                        "n_views": tri.n_views,
+                        "triangulation_rms_px": tri.triangulation_rms_px,
+                        "max_residual_px": tri.max_residual_px,
+                    }
+                )
+                return jsonify(
+                    {
+                        "pcb_xyz_mm": pcb_xyz,
+                        "method": method,
+                        "n_views": tri.n_views,
+                        "triangulation_rms_px": tri.triangulation_rms_px,
+                        "max_residual_px": tri.max_residual_px,
+                        "per_click_residuals_px": tri.per_click_residuals_px,
+                    }
+                )
+            # Single-click case: fall through to the existing ray-cast logic
+            # (unwrap clicks[0] into the legacy fields).
             try:
                 feature_id = body["feature_id"]
                 first_click = clicks[0]
@@ -778,7 +882,10 @@ def _register_routes(app: Flask) -> None:
                 return (
                     jsonify(
                         {
-                            "error": "missing required field (feature_id, clicks[0].photo_id, clicks[0].pixel)"
+                            "error": (
+                                "missing required field "
+                                "(feature_id, clicks[0].photo_id, clicks[0].pixel)"
+                            )
                         }
                     ),
                     400,

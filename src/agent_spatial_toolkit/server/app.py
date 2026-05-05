@@ -31,6 +31,8 @@ Design notes
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import math
 import threading
@@ -322,6 +324,107 @@ def _register_routes(app: Flask) -> None:
         session: Session = app.config["SESSION"]
         mem: dict[str, Any] = app.config["STATE"]
         return jsonify(_state_snapshot(session, mem))
+
+    @app.post("/api/photo")
+    def post_photo() -> Any:
+        """Upload a photo to the session (design §3 photo lifecycle).
+
+        Accepts JPEG, PNG, HEIC, HEIF. HEIC/HEIF is transparently decoded
+        to JPEG via pillow-heif so iPhone users never see a format error.
+        Photo ID is content-derived (``photo_<sha256[:12]>``) so re-upload
+        of the same content is idempotent. Persists JPEG to
+        ``<session>/photos/<photo_id>.jpg`` via the atomic tmp+rename
+        pattern.
+        """
+        # Lazy import — keeps create_app() startup fast and avoids
+        # paying the pillow-heif import cost on servers that never see
+        # an HEIC upload.
+        import pillow_heif
+        from PIL import Image
+
+        # 50 MB cap; phone shots rarely exceed 30 MB even at max-res HEIF.
+        max_bytes = 50 * 1024 * 1024
+
+        content_type = (request.content_type or "").lower().split(";")[0].strip()
+        if content_type not in {"image/jpeg", "image/png", "image/heic", "image/heif"}:
+            return (
+                jsonify(
+                    {"error": ("Please use JPEG, PNG, or HEIC. Most phones export one of these.")}
+                ),
+                415,
+            )
+
+        body = request.get_data(cache=False)
+        if len(body) > max_bytes:
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            "This photo is unusually large (>50 MB) — reshoot at lower resolution."
+                        )
+                    }
+                ),
+                413,
+            )
+
+        sha256 = hashlib.sha256(body).hexdigest()
+        photo_id = f"photo_{sha256[:12]}"
+
+        # Decode then re-encode as JPEG for consistent on-disk format.
+        # register_heif_opener() is idempotent so calling it on every
+        # HEIC/HEIF request is safe.
+        if content_type in {"image/heic", "image/heif"}:
+            pillow_heif.register_heif_opener()
+        try:
+            img = Image.open(io.BytesIO(body))
+            img.load()  # force decode now so failures surface here, not later
+        except Exception as e:
+            return jsonify({"error": f"could not decode image: {e}"}), 400
+
+        # JPEG can't encode RGBA / palette modes — convert. HEIC and PNG
+        # frequently arrive with alpha or non-RGB modes.
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+
+        session: Session = app.config["SESSION"]
+        photos_dir = session.session_dir / "photos"
+        photo_path = photos_dir / f"{photo_id}.jpg"
+        # Atomic write: write to .jpg.tmp then rename. Mirrors the precedent
+        # set in session.py / emit.py / app.py finalize.
+        tmp_path = photo_path.with_suffix(".jpg.tmp")
+        img.save(tmp_path, format="JPEG", quality=95)
+        tmp_path.replace(photo_path)
+
+        # Update in-memory state. Idempotent: re-upload of the same content
+        # produces the same photo_id, so we keep the existing record.
+        mem: dict[str, Any] = app.config["STATE"]
+        if photo_id not in mem["photos"]:
+            mem["photos"][photo_id] = {
+                "id": photo_id,
+                "path": str(photo_path),
+                "sha256": sha256,
+                "intrinsics": None,  # populated when /api/reference (or /api/anchors) runs
+                "pose": None,
+                "anchors": [],
+            }
+
+        event_log: EventLog = app.config["EVENT_LOG"]
+        event_log.write(
+            {
+                "type": "photo_uploaded",
+                "photo_id": photo_id,
+                "sha256": sha256,
+                "source_format": content_type,
+            }
+        )
+
+        return jsonify(
+            {
+                "photo_id": photo_id,
+                "sha256": sha256,
+                "stored_format": "jpeg",
+            }
+        )
 
     @app.get("/api/lens_catalog")
     def get_lens_catalog() -> Any:

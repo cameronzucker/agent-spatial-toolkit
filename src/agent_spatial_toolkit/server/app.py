@@ -40,6 +40,7 @@ import time
 from pathlib import Path
 from typing import Any, Protocol
 
+import cv2
 import numpy as np
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
@@ -1060,8 +1061,100 @@ def _register_routes(app: Flask) -> None:
 
     @app.get("/api/reproject_all")
     def get_reproject_all() -> Any:
-        """Stub: PR-3 wires per-feature reprojection error in mm."""
-        return jsonify({"features": []})
+        """For every (photo, feature) where the feature is triangulated,
+        project its 3D position into the photo and report the predicted
+        pixel + error_mm. Single-view-planar features are reported on
+        their owning photo only.
+
+        Response: {"by_photo": {photo_id: [{feature_id, predicted_pixel,
+        error_mm}, ...], ...}}.
+        """
+        from agent_spatial_toolkit.pipeline.error_mm import (
+            feature_error_mm_planar,
+            feature_error_mm_triangulated,
+        )
+
+        mem: dict[str, Any] = app.config["STATE"]
+        by_photo: dict[str, list[dict[str, Any]]] = {}
+
+        # Initialize a per-photo list for every photo with a pose.
+        for photo_id, entry in mem["photos"].items():
+            if isinstance(entry.get("pose"), PoseResult):
+                by_photo[photo_id] = []
+
+        for feature_id, feat in mem["features"].items():
+            method: str = feat.get("method", "")
+            xyz = np.array(feat.get("pcb_xyz_mm", [0.0, 0.0, 0.0]), dtype=np.float64)
+
+            if method.startswith("triangulation_"):
+                # Project into every photo the feature was clicked in.
+                clicks = feat.get("clicks", [])
+                for click in clicks:
+                    photo_id = click["photo_id"]
+                    photo_entry = mem["photos"].get(photo_id)
+                    if photo_entry is None or not isinstance(photo_entry.get("pose"), PoseResult):
+                        continue
+                    intrinsics = _intrinsics_from_dict(photo_entry["intrinsics"])
+                    pose: PoseResult = photo_entry["pose"]
+                    K = intrinsics.to_camera_matrix()  # noqa: N806
+                    dist = np.array(intrinsics.distortion, dtype=np.float64)
+                    projected, _ = cv2.projectPoints(
+                        xyz.reshape(1, 1, 3),
+                        pose.rvec.astype(np.float64),
+                        pose.tvec.astype(np.float64),
+                        K,
+                        dist,
+                    )
+                    u, v = projected.reshape(2)
+                    residual = float(click.get("reprojection_residual_px", 0.0))
+                    err_mm = feature_error_mm_triangulated(
+                        feature_xyz_mm=xyz,
+                        pose=pose,
+                        intrinsics=intrinsics,
+                        residual_px=residual,
+                    )
+                    by_photo.setdefault(photo_id, []).append(
+                        {
+                            "feature_id": feature_id,
+                            "predicted_pixel": [float(u), float(v)],
+                            "error_mm": err_mm,
+                        }
+                    )
+            elif method == "planar_intersection":
+                # Single-view: report on the owning photo only.
+                photo_id = feat.get("photo_id")
+                if photo_id is None:
+                    continue
+                photo_entry = mem["photos"].get(photo_id)
+                if photo_entry is None or not isinstance(photo_entry.get("pose"), PoseResult):
+                    continue
+                intrinsics = _intrinsics_from_dict(photo_entry["intrinsics"])
+                pose = photo_entry["pose"]
+                K = intrinsics.to_camera_matrix()  # noqa: N806
+                dist = np.array(intrinsics.distortion, dtype=np.float64)
+                projected, _ = cv2.projectPoints(
+                    xyz.reshape(1, 1, 3),
+                    pose.rvec.astype(np.float64),
+                    pose.tvec.astype(np.float64),
+                    K,
+                    dist,
+                )
+                u, v = projected.reshape(2)
+                # Planar features have no per-photo residual stored; report 0.
+                err_mm = feature_error_mm_planar(
+                    pose=pose,
+                    intrinsics=intrinsics,
+                    residual_px=0.0,
+                )
+                by_photo.setdefault(photo_id, []).append(
+                    {
+                        "feature_id": feature_id,
+                        "predicted_pixel": [float(u), float(v)],
+                        "error_mm": err_mm,
+                    }
+                )
+
+        return jsonify({"by_photo": by_photo})
 
     @app.post("/api/finalize")
     def post_finalize() -> Any:

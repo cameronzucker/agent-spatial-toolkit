@@ -1019,12 +1019,82 @@ def test_marker_detect_stub_returns_null_corners(app_factory) -> None:
     assert response.get_json() == {"corners": None}
 
 
-def test_reproject_all_stub_returns_empty_features(app_factory) -> None:
-    app, session, server = app_factory()
+def test_reproject_all_returns_by_photo_dict_after_triangulation(app_factory) -> None:
+    """After triangulating one feature, /api/reproject_all returns predicted
+    pixels + error_mm per (photo, feature)."""
+    import cv2 as _cv2
+
+    app, _, _ = app_factory()
     client = app.test_client()
-    response = client.get("/api/reproject_all")
-    assert response.status_code == 200
-    assert response.get_json() == {"features": []}
+
+    # Set up two poses + a triangulated feature (re-using the fixture pattern).
+    payload1 = _valid_anchors_payload()
+    payload1["photo_id"] = "v1"
+    r1 = client.post("/api/anchors", json=payload1)
+    assert r1.status_code == 200, r1.get_json()
+
+    K = np.array([[1000.0, 0, 500.0], [0, 1000.0, 500.0], [0, 0, 1]], dtype=np.float64)  # noqa: N806
+    rvec2 = np.array([0.0, 0.3, 0.0])
+    tvec2 = np.array([-60.0, -15.0, 200.0])
+    world_pts = np.array([[0.0, 0.0, 0.0], [50.0, 0.0, 0.0], [50.0, 30.0, 0.0], [0.0, 30.0, 0.0]])
+    pixels2, _ = _cv2.projectPoints(world_pts, rvec2, tvec2, K, np.zeros(5))
+    payload2 = {
+        "photo_id": "v2",
+        "intrinsics": _make_test_intrinsics_dict(1000, 1000),
+        "image_size": [1000, 1000],
+        "anchors": [
+            {
+                "id": f"a{i}",
+                "pcb_xyz_mm": world_pts[i].tolist(),
+                "pixel": pixels2.reshape(-1, 2)[i].tolist(),
+            }
+            for i in range(4)
+        ],
+    }
+    r2 = client.post("/api/anchors", json=payload2)
+    assert r2.status_code == 200, r2.get_json()
+
+    target = np.array([15.0, 10.0, 0.0])
+    p1, _ = _cv2.projectPoints(
+        target.reshape(1, 1, 3), np.zeros(3), np.array([-25.0, -15.0, 200.0]), K, np.zeros(5)
+    )
+    p2, _ = _cv2.projectPoints(target.reshape(1, 1, 3), rvec2, tvec2, K, np.zeros(5))
+
+    feat_resp = client.post(
+        "/api/feature",
+        json={
+            "feature_id": "f_tri",
+            "clicks": [
+                {"photo_id": "v1", "pixel": p1.reshape(2).tolist()},
+                {"photo_id": "v2", "pixel": p2.reshape(2).tolist()},
+            ],
+        },
+    )
+    assert feat_resp.status_code == 200, feat_resp.get_json()
+
+    resp = client.get("/api/reproject_all")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert "by_photo" in body
+    assert "v1" in body["by_photo"]
+    assert "v2" in body["by_photo"]
+    v1_entries = body["by_photo"]["v1"]
+    assert len(v1_entries) == 1
+    assert v1_entries[0]["feature_id"] == "f_tri"
+    assert "predicted_pixel" in v1_entries[0]
+    assert "error_mm" in v1_entries[0]
+    assert isinstance(v1_entries[0]["predicted_pixel"], list)
+    assert len(v1_entries[0]["predicted_pixel"]) == 2
+
+
+def test_reproject_all_empty_state_returns_empty_by_photo(app_factory) -> None:
+    """No features → by_photo: {} (still well-typed object)."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    resp = client.get("/api/reproject_all")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body == {"by_photo": {}}
 
 
 # ─────────────────────────────────────────────────────────────────────────

@@ -1238,12 +1238,6 @@ def _register_routes(app: Flask) -> None:
         if len(suspect_photos) >= 2:
             auto_flags.append("intrinsics_session_recommend_chessboard")
 
-        # Merge: server-derived auto-flags + in-memory accumulated flags +
-        # caller-supplied. Dedupe via dict-of-keys preserving order.
-        all_flags = list(
-            dict.fromkeys(auto_flags + list(mem.get("flags", [])) + list(caller_flags))
-        )
-
         # Read manifest.json (written by the CLI in PR #27) for sha256 + path.
         # Manifest missing or corrupt is non-fatal: the server tolerates a
         # no-CLI test/dev path by falling back to empty sha256 + a default
@@ -1258,8 +1252,17 @@ def _register_routes(app: Flask) -> None:
 
         # Build SessionState from the in-memory state.
         photos_out: list[Photo] = []
+        skipped_unsolved_flags: list[str] = []
         for photo_id, entry in mem["photos"].items():
-            pose = entry["pose"]
+            pose = entry.get("pose")
+            intr = entry.get("intrinsics")
+            if pose is None or intr is None:
+                # Photo was uploaded via /api/photo but never had pose solved
+                # via /api/reference (or /api/anchors). Skip it from the
+                # final annotations and surface a per-photo flag so the LLM
+                # downstream sees what happened.
+                skipped_unsolved_flags.append(f"pose_skipped_uploaded_only:{photo_id}")
+                continue
             anchors_clicked = [
                 AnchorClick(
                     id=a["id"],
@@ -1280,6 +1283,18 @@ def _register_routes(app: Flask) -> None:
                     anchors_clicked=anchors_clicked,
                 )
             )
+
+        # Merge: server-derived auto-flags + per-photo skipped flags +
+        # in-memory accumulated flags + caller-supplied. Dedupe via
+        # dict-of-keys preserving order.
+        all_flags = list(
+            dict.fromkeys(
+                auto_flags
+                + skipped_unsolved_flags
+                + list(mem.get("flags", []))
+                + list(caller_flags)
+            )
+        )
 
         features_out: list[Feature] = []
         for feature_id, entry in mem["features"].items():

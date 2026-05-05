@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -470,6 +471,36 @@ def test_finalize_rejects_invalid_flag(app_factory) -> None:
     assert "error" in resp.get_json()
     # annotations.json must NOT have been written when validation rejects flags
     assert not (session.session_dir / "annotations.json").exists()
+
+
+def test_finalize_skips_unsolved_uploaded_photos(app_factory) -> None:
+    """A photo uploaded but never anchored is skipped from the final
+    annotations.json with a 'pose_skipped_uploaded_only:<id>' flag."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    # Upload one photo without anchoring it.
+    unsolved_id = _upload_test_photo(client)
+
+    # Set up one photo with a valid pose so finalize has something to emit.
+    anchors_resp = client.post("/api/anchors", json=_valid_anchors_payload())
+    assert anchors_resp.status_code == 200
+
+    resp = client.post("/api/finalize", json={})
+    assert resp.status_code == 200, resp.get_json()
+    out_path = Path(resp.get_json()["annotations_path"])
+    assert out_path.is_file()
+    annotations = json.loads(out_path.read_text(encoding="utf-8"))
+
+    # Unsolved photo MUST NOT appear in photos[]
+    photo_ids_in_annotations = [p["id"] for p in annotations["photos"]]
+    assert unsolved_id not in photo_ids_in_annotations
+    # Solved photo IS present.
+    assert "top_down" in photo_ids_in_annotations
+
+    # The flag is recorded in quality_summary.flags.
+    flags = annotations["quality_summary"]["flags"]
+    assert any(f.startswith("pose_skipped_uploaded_only:") and unsolved_id in f for f in flags)
 
 
 # ─────────────────────────────────────────────────────────────────────────

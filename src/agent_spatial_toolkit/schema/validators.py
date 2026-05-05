@@ -19,6 +19,7 @@ QUALITY_FLAGS: dict[str, bool] = {
     "feature_clicked_only_once": True,  # requires :<feature_id>
     "feature_high_triangulation_rms": True,  # requires :<feature_id>
     "ultrawide_lens_rejected": True,  # requires :<photo_id>
+    "pose_skipped_uploaded_only": True,  # PR-3: photo uploaded via /api/photo but never anchored
 }
 
 

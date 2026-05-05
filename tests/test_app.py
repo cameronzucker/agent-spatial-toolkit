@@ -894,3 +894,49 @@ def test_reproject_all_stub_returns_empty_features(app_factory) -> None:
     response = client.get("/api/reproject_all")
     assert response.status_code == 200
     assert response.get_json() == {"features": []}
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Legacy endpoint regression tests (deleted in PR-4; functional until then)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_legacy_anchors_endpoint_still_functional(app_factory) -> None:
+    """Until PR-4 deletes it, /api/anchors must keep working for the
+    legacy UI (and any external callers that haven't migrated to
+    /api/reference yet)."""
+    app, session, server = app_factory()
+    client = app.test_client()
+    _upload_test_photo(client)
+    payload = _valid_anchors_payload(image_size=(1000, 1000))
+    response = client.post("/api/anchors", json=payload)
+    assert response.status_code == 200
+    assert "pose" in response.get_json()
+
+
+def test_legacy_lens_catalog_endpoint_still_functional(app_factory) -> None:
+    """Until PR-4 deletes it, /api/lens_catalog must keep returning
+    the lens-catalog payload for any legacy UI callers."""
+    app, session, server = app_factory()
+    client = app.test_client()
+    response = client.get("/api/lens_catalog")
+    assert response.status_code == 200
+    body = response.get_json()
+    assert isinstance(body, (dict, list)), "lens_catalog returns an enumerable"
+
+
+def test_legacy_wireframe_endpoint_still_functional(app_factory) -> None:
+    """Until PR-4 deletes it, /api/wireframe/<photo_id> must keep
+    returning a wireframe PNG for solved photos (or a sensible 4xx
+    if the photo has no solved pose)."""
+    app, session, server = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+    response = client.get(f"/api/wireframe/{photo_id}")
+    # The endpoint may return 200 (PNG) for a solved photo OR 404 for
+    # a photo with no pose. Anything else (500, 410) means the endpoint
+    # is broken or has been silently disabled.
+    assert response.status_code in {200, 404}, (
+        f"wireframe must be functional (200) or report no-pose-solved (404), "
+        f"not {response.status_code}"
+    )

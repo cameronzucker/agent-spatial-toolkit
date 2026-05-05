@@ -1067,6 +1067,14 @@ def _register_routes(app: Flask) -> None:
         photo_state = mem["photos"].get(safe_id)
         if photo_state is None:
             return jsonify({"error": f"no pose for photo {safe_id}"}), 404
+        # /api/photo (PR-2 Task 3) creates a photo entry before any pose is
+        # solved (intrinsics=None, pose=None). The wireframe endpoint
+        # pre-dates that flow and historically assumed photo_state was only
+        # populated post-anchors. Without this check, GET /api/wireframe
+        # for an upload-only photo returns 500 (NoneType subscript). 404 is
+        # the correct legacy contract: "no pose for this photo yet".
+        if photo_state.get("pose") is None or photo_state.get("intrinsics") is None:
+            return jsonify({"error": f"no pose for photo {safe_id}"}), 404
 
         # Locate the source photo file (id may be the basename without extension
         # or with — handle both by globbing).

@@ -29,6 +29,52 @@ Design notes
 - All error responses use the shape ``{"error": str}`` with no stack traces.
 """
 
+# PR-4-HANDOFF: user-facing-translation-required ----------------------------
+# Per design §9 (forbidden vocabulary) the strings listed below are NOT
+# safe to display verbatim in the wizard UI — they currently use CV jargon
+# that non-CAD users won't understand. PR-4's UI MUST translate each to
+# plain English before showing to the user. This list is exhaustive as of
+# PR-3 merge; if PR-4 adds new error strings, this list MUST be updated.
+#
+# Routes & strings:
+#   /api/anchors:
+#     - "PnP failed: anchors are degenerate or insufficient"
+#     - "must provide either intrinsics or lens_id"
+#     - "lens_id '<id>' could not resolve to intrinsics; provide an explicit
+#        intrinsics dict"
+#     - "invalid intrinsics: <e>"
+#     - "invalid anchor entries: <e>"
+#     - "internal error during pose solve"
+#   /api/reference:
+#     - "pose solve failed: corners may be too oblique or mis-clicked"
+#     - "could not derive camera intrinsics; provide an explicit intrinsics dict"
+#     - "invalid intrinsics: <e>"
+#     - "internal error during pose solve"
+#   /api/feature:
+#     - "no pose for photo <id>"   (multiple call sites: legacy + triangulation)
+#     - "photo '<id>' has no pose; call /api/anchors first"  (legacy fallback path)
+#     - "unknown photo_id '<id>' in clicks[<i>]"  (triangulation path)
+#     - "stored intrinsics are malformed: <e>"
+#     - "v1 triangulates from up to 6 views; received <N> — please reduce to
+#        your 6 best views"
+#     - "internal error during ray-cast"
+#     - "method '<m>' not implemented in v0.1.0-alpha (β-mode only)"
+#   /api/wireframe:
+#     - "no pose for photo <id>"
+#     - "stored intrinsics invalid: <e>"
+#     - "wireframe render failed: <e>"
+#   /api/marker_detect:
+#     - "photo file for <id> not found on disk"
+#   (Routes not listed here ship only plain-English errors safe to forward.)
+#
+# /api/next_prompt response: the `direction` field is an internal axis label
+# (e.g., '+long', '-short') — UI MUST render it as a silhouette icon, never
+# as prose. The `reason` field is a fallback English string that interpolates
+# the axis label literally; UI MUST render the localized prose from
+# `reason_code` (an enum) instead. The fallback `reason` is for debugger
+# inspection only.
+# ---------------------------------------------------------------------------
+
 from __future__ import annotations
 
 import hashlib
@@ -40,13 +86,20 @@ import time
 from pathlib import Path
 from typing import Any, Protocol
 
+import cv2
 import numpy as np
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
 from agent_spatial_toolkit.pipeline.emit import SessionState, emit_annotations
+from agent_spatial_toolkit.pipeline.error_mm import pose_rms_mm
 from agent_spatial_toolkit.pipeline.intrinsics import Intrinsics
 from agent_spatial_toolkit.pipeline.pose import PoseResult, PoseSolveError, solve_pnp
 from agent_spatial_toolkit.pipeline.ray import pixel_to_part_local
+from agent_spatial_toolkit.pipeline.triangulate import (
+    MAX_VIEWS,
+    TriangulationError,
+    triangulate_feature,
+)
 from agent_spatial_toolkit.schema.models import (
     AnchorClick,
     CameraDetected,
@@ -586,6 +639,7 @@ def _register_routes(app: Flask) -> None:
 
         event_log: EventLog = app.config["EVENT_LOG"]
         mem: dict[str, Any] = app.config["STATE"]
+        session: Session = app.config["SESSION"]
 
         body = request.get_json(silent=True) or {}
         try:
@@ -637,27 +691,71 @@ def _register_routes(app: Flask) -> None:
             except (KeyError, TypeError, ValueError) as e:
                 return jsonify({"error": f"invalid intrinsics: {e}"}), 400
         else:
+            # Fallback chain: lens_id (if provided) → EXIF (if photo on disk
+            # carries focal_35) → wide-class default. Each fallback raises
+            # the intrinsics_estimated flag for the LLM downstream.
             lens_id = body.get("lens_id")
-            if not lens_id:
-                return (
-                    jsonify({"error": "must provide either intrinsics or lens_id"}),
-                    400,
-                )
-            from agent_spatial_toolkit.server.lens_catalog import resolve as _resolve_lens
+            intr_obj: Intrinsics | None = None
 
-            intr_obj = _resolve_lens(lens_id, image_size, exif=body.get("exif"))
+            if lens_id:
+                from agent_spatial_toolkit.server.lens_catalog import resolve as _resolve_lens
+
+                intr_obj = _resolve_lens(lens_id, image_size, exif=body.get("exif"))
+
+            # EXIF in request body (UI extracted client-side).
             if intr_obj is None:
-                return (
-                    jsonify(
-                        {
-                            "error": (
-                                f"lens_id '{lens_id}' could not resolve to intrinsics; "
-                                "provide an explicit intrinsics dict"
-                            )
-                        }
-                    ),
-                    400,
+                exif = body.get("exif") or {}
+                focal_35 = exif.get("focal_length_35mm_equiv") if isinstance(exif, dict) else None
+                if focal_35 is not None:
+                    from agent_spatial_toolkit.pipeline.intrinsics import (
+                        resolve_fallback_intrinsics,
+                    )
+
+                    intr_obj = resolve_fallback_intrinsics(float(focal_35), image_size)
+
+            # EXIF read directly from the photo file on disk.
+            if intr_obj is None:
+                photos_dir = session.session_dir / "photos"
+                candidates = list(photos_dir.glob(f"{photo_id}.*"))
+                if candidates:
+                    from agent_spatial_toolkit.pipeline.intrinsics import (
+                        extract_exif_camera_info,
+                        resolve_fallback_intrinsics,
+                    )
+
+                    cam_info = extract_exif_camera_info(candidates[0])
+                    if cam_info is not None and cam_info.focal_length_35mm_equiv is not None:
+                        intr_obj = resolve_fallback_intrinsics(
+                            cam_info.focal_length_35mm_equiv, image_size
+                        )
+
+            # Final fallback: wide-class (24 mm 35mm-equiv) default.
+            if intr_obj is None:
+                from agent_spatial_toolkit.pipeline.intrinsics import (
+                    resolve_fallback_intrinsics,
                 )
+
+                intr_obj = resolve_fallback_intrinsics(24.0, image_size)
+                if intr_obj is None:
+                    return (
+                        jsonify(
+                            {
+                                "error": (
+                                    "could not derive camera intrinsics; "
+                                    "provide an explicit intrinsics dict"
+                                )
+                            }
+                        ),
+                        400,
+                    )
+
+            # Fallback paths all raise the estimation flag (the schema's
+            # intrinsics_estimated, schema-merged in PR-1).
+            existing = list(mem.get("flags", []))
+            if "intrinsics_estimated" not in existing:
+                existing.append("intrinsics_estimated")
+                mem["flags"] = existing
+
             intrinsics = intr_obj
             intrinsics_dict = intr_obj.to_dict()
 
@@ -719,10 +817,16 @@ def _register_routes(app: Flask) -> None:
             }
         )
 
+        rms_mm_value = pose_rms_mm(
+            pose=pose,
+            intrinsics=intrinsics,
+            anchor_rms_px=pose.anchor_reprojection_rms_px,
+        )
         return jsonify(
             {
                 "pose": pose.to_dict(),
                 "intrinsics_suspect": pose.intrinsics_suspect,
+                "pose_rms_mm": rms_mm_value,
             }
         )
 
@@ -757,18 +861,117 @@ def _register_routes(app: Flask) -> None:
                 return jsonify({"error": "clicks must be an array"}), 400
             if len(clicks) == 0:
                 return jsonify({"error": "clicks must contain at least one entry"}), 400
-            if len(clicks) >= 2:
+            if len(clicks) > MAX_VIEWS:
                 return (
                     jsonify(
                         {
-                            "error": "triangulation not yet implemented; arrives in PR-3",
-                            "n_clicks_received": len(clicks),
+                            "error": (
+                                f"v1 triangulates from up to {MAX_VIEWS} views; "
+                                f"received {len(clicks)} — please reduce to your "
+                                f"{MAX_VIEWS} best views"
+                            )
                         }
                     ),
-                    501,
+                    400,
                 )
-            # Single-click case: unwrap clicks[0] into the legacy fields the
-            # existing ray-cast logic below already understands.
+            if len(clicks) >= 2:
+                # Multi-view triangulation path. Build (pose, intrinsics, pixel)
+                # triples for each click; any missing photo / pose / intrinsics
+                # is a 404 with the offending photo_id called out.
+                try:
+                    feature_id = body["feature_id"]
+                except (KeyError, TypeError):
+                    return (
+                        jsonify({"error": "missing required field: feature_id"}),
+                        400,
+                    )
+                view_triples: list[Any] = []
+                for i, click in enumerate(clicks):
+                    try:
+                        c_photo_id = click["photo_id"]
+                        c_pixel = click["pixel"]
+                    except (KeyError, TypeError):
+                        return (
+                            jsonify(
+                                {"error": (f"clicks[{i}] missing required field (photo_id, pixel)")}
+                            ),
+                            400,
+                        )
+                    photo_entry = mem["photos"].get(c_photo_id)
+                    if photo_entry is None:
+                        return (
+                            jsonify({"error": f"unknown photo_id '{c_photo_id}' in clicks[{i}]"}),
+                            404,
+                        )
+                    if photo_entry.get("pose") is None or photo_entry.get("intrinsics") is None:
+                        return (
+                            jsonify({"error": f"no pose for photo {c_photo_id}"}),
+                            404,
+                        )
+                    try:
+                        intrinsics_obj = _intrinsics_from_dict(photo_entry["intrinsics"])
+                    except (KeyError, TypeError, ValueError) as e:
+                        return (
+                            jsonify({"error": f"stored intrinsics are malformed: {e}"}),
+                            500,
+                        )
+                    pose_obj: PoseResult = photo_entry["pose"]
+                    try:
+                        pixel_pair = (
+                            _coerce_finite_float(c_pixel[0], f"clicks[{i}].pixel[0]"),
+                            _coerce_finite_float(c_pixel[1], f"clicks[{i}].pixel[1]"),
+                        )
+                    except (TypeError, ValueError, IndexError) as e:
+                        return jsonify({"error": str(e)}), 400
+                    view_triples.append((pose_obj, intrinsics_obj, pixel_pair))
+
+                try:
+                    tri = triangulate_feature(view_triples)
+                except TriangulationError as e:
+                    return jsonify({"error": str(e)}), 400
+
+                method = f"triangulation_{tri.n_views}_views"
+                pcb_xyz = [float(tri.xyz_mm[0]), float(tri.xyz_mm[1]), float(tri.xyz_mm[2])]
+                # Persist with the multi-view shape: clicks list (not single
+                # pixel), method enum reflecting view count, and the residual
+                # metadata for emit.py to surface in quality_summary.
+                mem["features"][feature_id] = {
+                    "photo_id": clicks[0]["photo_id"],  # primary photo for legacy state-shape
+                    "pixel": [float(clicks[0]["pixel"][0]), float(clicks[0]["pixel"][1])],
+                    "pcb_xyz_mm": pcb_xyz,
+                    "method": method,
+                    "clicks": [
+                        {
+                            "photo_id": c["photo_id"],
+                            "pixel": [float(c["pixel"][0]), float(c["pixel"][1])],
+                            "reprojection_residual_px": tri.per_click_residuals_px[i],
+                        }
+                        for i, c in enumerate(clicks)
+                    ],
+                    "triangulation_rms_px": tri.triangulation_rms_px,
+                    "max_residual_px": tri.max_residual_px,
+                }
+                event_log.write(
+                    {
+                        "type": "feature_triangulated",
+                        "feature_id": feature_id,
+                        "n_views": tri.n_views,
+                        "triangulation_rms_px": tri.triangulation_rms_px,
+                        "max_residual_px": tri.max_residual_px,
+                    }
+                )
+                return jsonify(
+                    {
+                        "pcb_xyz_mm": pcb_xyz,
+                        "method": method,
+                        "n_views": tri.n_views,
+                        "triangulation_rms_px": tri.triangulation_rms_px,
+                        "max_residual_px": tri.max_residual_px,
+                        "per_click_residuals_px": tri.per_click_residuals_px,
+                    }
+                )
+            # Single-click case: fall through to the existing ray-cast logic
+            # (unwrap clicks[0] into the legacy fields).
             try:
                 feature_id = body["feature_id"]
                 first_click = clicks[0]
@@ -778,7 +981,10 @@ def _register_routes(app: Flask) -> None:
                 return (
                     jsonify(
                         {
-                            "error": "missing required field (feature_id, clicks[0].photo_id, clicks[0].pixel)"
+                            "error": (
+                                "missing required field "
+                                "(feature_id, clicks[0].photo_id, clicks[0].pixel)"
+                            )
                         }
                     ),
                     400,
@@ -861,32 +1067,185 @@ def _register_routes(app: Flask) -> None:
 
     @app.get("/api/marker_detect/<path:photo_id>")
     def get_marker_detect(photo_id: str) -> Any:
-        """Stub: real cv2.aruco.detectMarkers wiring lands in PR-3."""
-        return jsonify({"corners": None})
+        """Run cv2.aruco.detectMarkers against the photo on disk.
+
+        Returns ``{"corners": [[x, y], [x, y], [x, y], [x, y]]}`` clockwise
+        from top-left when the wizard's MARKER_ID is found; ``{"corners":
+        null}`` when no marker is detected (the UI falls through to the
+        manual corner walkthrough). 404 if the photo file is missing on
+        disk.
+        """
+        from werkzeug.utils import secure_filename
+
+        from agent_spatial_toolkit.server.marker_detect import detect_marker_corners
+
+        safe_id = secure_filename(photo_id)
+        if not safe_id or safe_id != photo_id:
+            return jsonify({"error": "invalid photo_id"}), 404
+
+        session: Session = app.config["SESSION"]
+        photos_dir = session.session_dir / "photos"
+        candidates = list(photos_dir.glob(f"{safe_id}.*"))
+        # Filter to safe candidates only (no traversal escape).
+        photos_dir_resolved = photos_dir.resolve()
+        safe_candidates = [c for c in candidates if c.resolve().is_relative_to(photos_dir_resolved)]
+        if not safe_candidates:
+            return jsonify({"error": f"photo file for {safe_id} not found on disk"}), 404
+
+        try:
+            corners = detect_marker_corners(safe_candidates[0])
+        except FileNotFoundError:
+            return jsonify({"error": f"photo file for {safe_id} not found on disk"}), 404
+
+        if corners is None:
+            return jsonify({"corners": None})
+        return jsonify({"corners": [[x, y] for x, y in corners]})
 
     @app.get("/api/next_prompt")
     def get_next_prompt() -> Any:
-        """Stub: returns typed shape with placeholder values; real
-        scoring algorithm (design §4) lands in PR-3."""
-        return jsonify(
-            {
-                "direction": "+long",
-                "reason": "Server scoring not yet implemented (PR-3)",
-                "coverage_cells": {
-                    "top": False,
-                    "+long": False,
-                    "-long": False,
-                    "+short": False,
-                    "-short": False,
-                },
-                "features": [],
-            }
+        """Return the next-photo prompt per design §4 scoring algorithm.
+
+        Computes per-feature `max_error_mm` from the stored triangulation
+        residuals so the suppression rule (≥6 features uniformly green-tier)
+        can fire even with fewer than 3 cells filled.
+        """
+        from agent_spatial_toolkit.pipeline.error_mm import (
+            feature_error_mm_triangulated,
         )
+        from agent_spatial_toolkit.server.next_prompt import score_next_prompt
+
+        mem: dict[str, Any] = app.config["STATE"]
+
+        photos_in: list[dict[str, Any]] = []
+        for photo_id, entry in mem["photos"].items():
+            pose = entry.get("pose")
+            if isinstance(pose, PoseResult):
+                photos_in.append({"id": photo_id, "pose": pose})
+
+        features_in: list[dict[str, Any]] = []
+        for feature_id, feat in mem["features"].items():
+            method = feat.get("method", "")
+            entry = {"id": feature_id, "method": method}
+            # For triangulated features, compute the worst per-photo mm error
+            # so score_next_prompt can apply the suppression rule.
+            if method.startswith("triangulation_"):
+                xyz = np.array(feat.get("pcb_xyz_mm", [0.0, 0.0, 0.0]), dtype=np.float64)
+                clicks = feat.get("clicks", [])
+                worst_mm = 0.0
+                for click in clicks:
+                    photo_entry = mem["photos"].get(click.get("photo_id"))
+                    if photo_entry is None or not isinstance(photo_entry.get("pose"), PoseResult):
+                        continue
+                    intrinsics = _intrinsics_from_dict(photo_entry["intrinsics"])
+                    err_mm = feature_error_mm_triangulated(
+                        feature_xyz_mm=xyz,
+                        pose=photo_entry["pose"],
+                        intrinsics=intrinsics,
+                        residual_px=float(click.get("reprojection_residual_px", 0.0)),
+                    )
+                    if err_mm > worst_mm:
+                        worst_mm = err_mm
+                entry["max_error_mm"] = worst_mm
+            features_in.append(entry)
+
+        return jsonify(score_next_prompt(photos=photos_in, features=features_in))
 
     @app.get("/api/reproject_all")
     def get_reproject_all() -> Any:
-        """Stub: PR-3 wires per-feature reprojection error in mm."""
-        return jsonify({"features": []})
+        """For every (photo, feature) where the feature is triangulated,
+        project its 3D position into the photo and report the predicted
+        pixel + error_mm. Single-view-planar features are reported on
+        their owning photo only.
+
+        Response: {"by_photo": {photo_id: [{feature_id, predicted_pixel,
+        error_mm}, ...], ...}}.
+        """
+        from agent_spatial_toolkit.pipeline.error_mm import (
+            feature_error_mm_planar,
+            feature_error_mm_triangulated,
+        )
+
+        mem: dict[str, Any] = app.config["STATE"]
+        by_photo: dict[str, list[dict[str, Any]]] = {}
+
+        # Initialize a per-photo list for every photo with a pose.
+        for photo_id, entry in mem["photos"].items():
+            if isinstance(entry.get("pose"), PoseResult):
+                by_photo[photo_id] = []
+
+        for feature_id, feat in mem["features"].items():
+            method: str = feat.get("method", "")
+            xyz = np.array(feat.get("pcb_xyz_mm", [0.0, 0.0, 0.0]), dtype=np.float64)
+
+            if method.startswith("triangulation_"):
+                # Project into every photo the feature was clicked in.
+                clicks = feat.get("clicks", [])
+                for click in clicks:
+                    photo_id = click["photo_id"]
+                    photo_entry = mem["photos"].get(photo_id)
+                    if photo_entry is None or not isinstance(photo_entry.get("pose"), PoseResult):
+                        continue
+                    intrinsics = _intrinsics_from_dict(photo_entry["intrinsics"])
+                    pose: PoseResult = photo_entry["pose"]
+                    K = intrinsics.to_camera_matrix()  # noqa: N806
+                    dist = np.array(intrinsics.distortion, dtype=np.float64)
+                    projected, _ = cv2.projectPoints(
+                        xyz.reshape(1, 1, 3),
+                        pose.rvec.astype(np.float64),
+                        pose.tvec.astype(np.float64),
+                        K,
+                        dist,
+                    )
+                    u, v = projected.reshape(2)
+                    residual = float(click.get("reprojection_residual_px", 0.0))
+                    err_mm = feature_error_mm_triangulated(
+                        feature_xyz_mm=xyz,
+                        pose=pose,
+                        intrinsics=intrinsics,
+                        residual_px=residual,
+                    )
+                    by_photo.setdefault(photo_id, []).append(
+                        {
+                            "feature_id": feature_id,
+                            "predicted_pixel": [float(u), float(v)],
+                            "error_mm": err_mm,
+                        }
+                    )
+            elif method == "planar_intersection":
+                # Single-view: report on the owning photo only.
+                photo_id = feat.get("photo_id")
+                if photo_id is None:
+                    continue
+                photo_entry = mem["photos"].get(photo_id)
+                if photo_entry is None or not isinstance(photo_entry.get("pose"), PoseResult):
+                    continue
+                intrinsics = _intrinsics_from_dict(photo_entry["intrinsics"])
+                pose = photo_entry["pose"]
+                K = intrinsics.to_camera_matrix()  # noqa: N806
+                dist = np.array(intrinsics.distortion, dtype=np.float64)
+                projected, _ = cv2.projectPoints(
+                    xyz.reshape(1, 1, 3),
+                    pose.rvec.astype(np.float64),
+                    pose.tvec.astype(np.float64),
+                    K,
+                    dist,
+                )
+                u, v = projected.reshape(2)
+                # Planar features have no per-photo residual stored; report 0.
+                err_mm = feature_error_mm_planar(
+                    pose=pose,
+                    intrinsics=intrinsics,
+                    residual_px=0.0,
+                )
+                by_photo.setdefault(photo_id, []).append(
+                    {
+                        "feature_id": feature_id,
+                        "predicted_pixel": [float(u), float(v)],
+                        "error_mm": err_mm,
+                    }
+                )
+
+        return jsonify({"by_photo": by_photo})
 
     @app.post("/api/finalize")
     def post_finalize() -> Any:
@@ -925,12 +1284,6 @@ def _register_routes(app: Flask) -> None:
         if len(suspect_photos) >= 2:
             auto_flags.append("intrinsics_session_recommend_chessboard")
 
-        # Merge: server-derived auto-flags + in-memory accumulated flags +
-        # caller-supplied. Dedupe via dict-of-keys preserving order.
-        all_flags = list(
-            dict.fromkeys(auto_flags + list(mem.get("flags", [])) + list(caller_flags))
-        )
-
         # Read manifest.json (written by the CLI in PR #27) for sha256 + path.
         # Manifest missing or corrupt is non-fatal: the server tolerates a
         # no-CLI test/dev path by falling back to empty sha256 + a default
@@ -945,8 +1298,17 @@ def _register_routes(app: Flask) -> None:
 
         # Build SessionState from the in-memory state.
         photos_out: list[Photo] = []
+        skipped_unsolved_flags: list[str] = []
         for photo_id, entry in mem["photos"].items():
-            pose = entry["pose"]
+            pose = entry.get("pose")
+            intr = entry.get("intrinsics")
+            if pose is None or intr is None:
+                # Photo was uploaded via /api/photo but never had pose solved
+                # via /api/reference (or /api/anchors). Skip it from the
+                # final annotations and surface a per-photo flag so the LLM
+                # downstream sees what happened.
+                skipped_unsolved_flags.append(f"pose_skipped_uploaded_only:{photo_id}")
+                continue
             anchors_clicked = [
                 AnchorClick(
                     id=a["id"],
@@ -968,26 +1330,69 @@ def _register_routes(app: Flask) -> None:
                 )
             )
 
+        # Merge: server-derived auto-flags + per-photo skipped flags +
+        # in-memory accumulated flags + caller-supplied. Dedupe via
+        # dict-of-keys preserving order.
+        all_flags = list(
+            dict.fromkeys(
+                auto_flags
+                + skipped_unsolved_flags
+                + list(mem.get("flags", []))
+                + list(caller_flags)
+            )
+        )
+
         features_out: list[Feature] = []
         for feature_id, entry in mem["features"].items():
-            features_out.append(
-                Feature(
-                    id=feature_id,
-                    visible_in=[entry["photo_id"]],
-                    pcb_xyz_mm=tuple(entry["pcb_xyz_mm"]),
-                    measurements=FeatureMeasurement(
-                        method="planar_intersection",
-                        z_assumed_mm=entry.get("z_assumed_mm", 0.0),
-                        z_assumed_reason="single_photo_only_default",
-                        per_photo_clicks=[
-                            FeatureClick(
-                                photo=entry["photo_id"],
-                                pixel=tuple(entry["pixel"]),
-                            )
-                        ],
-                    ),
+            entry_method = entry.get("method", "")
+            if entry_method.startswith("triangulation_"):
+                # Multi-view triangulated feature (Task 2 / PR-3 marquee path).
+                # The feature was stored with a clicks list — each click
+                # carrying its own reprojection_residual_px — plus session-
+                # level triangulation_rms_px / max_residual_px. Emit the
+                # full multi-view shape; visible_in lists every click's
+                # photo_id, NOT just the primary.
+                clicks_entries = entry.get("clicks", [])
+                features_out.append(
+                    Feature(
+                        id=feature_id,
+                        visible_in=[c["photo_id"] for c in clicks_entries],
+                        pcb_xyz_mm=tuple(entry["pcb_xyz_mm"]),
+                        measurements=FeatureMeasurement(
+                            method=entry_method,  # type: ignore[arg-type]
+                            triangulation_rms_px=entry["triangulation_rms_px"],
+                            max_residual_px=entry["max_residual_px"],
+                            per_photo_clicks=[
+                                FeatureClick(
+                                    photo=c["photo_id"],
+                                    pixel=tuple(c["pixel"]),
+                                    reprojection_residual_px=c["reprojection_residual_px"],
+                                )
+                                for c in clicks_entries
+                            ],
+                        ),
+                    )
                 )
-            )
+            else:
+                # Single-view planar_intersection (legacy ray-cast path).
+                features_out.append(
+                    Feature(
+                        id=feature_id,
+                        visible_in=[entry["photo_id"]],
+                        pcb_xyz_mm=tuple(entry["pcb_xyz_mm"]),
+                        measurements=FeatureMeasurement(
+                            method="planar_intersection",
+                            z_assumed_mm=entry.get("z_assumed_mm", 0.0),
+                            z_assumed_reason="single_photo_only_default",
+                            per_photo_clicks=[
+                                FeatureClick(
+                                    photo=entry["photo_id"],
+                                    pixel=tuple(entry["pixel"]),
+                                )
+                            ],
+                        ),
+                    )
+                )
 
         state = SessionState(
             part_id=session.part_id,

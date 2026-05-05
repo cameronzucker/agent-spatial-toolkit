@@ -163,9 +163,10 @@ class Feature:
     measurements: FeatureMeasurement
     user_tags: list[str] = field(default_factory=list)
     noisy: bool = False
-    """True when triangulation reprojection error falls in the yellow band
-    (0.5–1.0 mm). Set by the redesigned wizard's tier-classification logic.
-    Emitted only when True (default-False is omitted)."""
+    """True when the feature's measurement quality falls in the yellow band
+    (0.5–1.0 mm) — i.e., usable but worse than the green tier. Set by the
+    redesigned wizard's tier-classification logic. Emitted only when True
+    (default-False is omitted)."""
     warning: str | None = None
     """Free-text human-readable note (e.g., 'Z is approximate; only 1 view
     available' for single-view-planar features). Emitted only when set."""

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -248,33 +249,113 @@ def test_post_feature_single_click_uses_existing_ray_cast(app_factory) -> None:
     assert body["pcb_xyz_mm"][2] == pytest.approx(0.0)
 
 
-def test_post_feature_two_clicks_returns_501(app_factory) -> None:
-    """POST /api/feature with 2 clicks returns 501 (triangulation deferred to PR-3)."""
+def test_post_feature_two_clicks_triangulates_to_known_point(app_factory) -> None:
+    """POST /api/feature with 2 clicks runs real triangulation; returns
+    pcb_xyz_mm + measurements with method=triangulation_2_views."""
     app, _, _ = app_factory()
     client = app.test_client()
 
-    # Establish pose so we get past prerequisite checks (state must exist for
-    # the route to be exercised end-to-end; the 501 short-circuit fires before
-    # any per-photo lookups but keeping the setup mirrors the real wizard flow).
-    anchors_resp = client.post("/api/anchors", json=_valid_anchors_payload())
-    assert anchors_resp.status_code == 200, anchors_resp.get_json()
+    # Establish poses for two photos by re-using the synthetic anchors fixture
+    # twice with different photo_ids.
+    payload1 = _valid_anchors_payload()
+    payload1["photo_id"] = "photo_view_1"
+    r1 = client.post("/api/anchors", json=payload1)
+    assert r1.status_code == 200, r1.get_json()
+
+    payload2 = _valid_anchors_payload()
+    payload2["photo_id"] = "photo_view_2"
+    # Shift the camera in payload2 so the two views are not identical.
+    # The anchor pixels are recomputed by _project_anchors via _valid_anchors_payload;
+    # for this test we need a genuinely different camera angle. Build it manually:
+    import cv2 as _cv2
+
+    world_pts = np.array([[0.0, 0.0, 0.0], [50.0, 0.0, 0.0], [50.0, 30.0, 0.0], [0.0, 30.0, 0.0]])
+    K = np.array([[1000.0, 0, 500.0], [0, 1000.0, 500.0], [0, 0, 1]], dtype=np.float64)  # noqa: N806
+    rvec2 = np.array([0.0, 0.3, 0.0])
+    tvec2 = np.array([-60.0, -15.0, 200.0])
+    pixels2, _ = _cv2.projectPoints(world_pts, rvec2, tvec2, K, np.zeros(5))
+    pixels2 = pixels2.reshape(-1, 2).tolist()
+    payload2["anchors"] = [
+        {"id": f"a{i}", "pcb_xyz_mm": world_pts[i].tolist(), "pixel": pixels2[i]} for i in range(4)
+    ]
+    r2 = client.post("/api/anchors", json=payload2)
+    assert r2.status_code == 200, r2.get_json()
+
+    # Now click the same physical point (15, 10, 0) in both views.
+    target = np.array([15.0, 10.0, 0.0])
+    p1, _ = _cv2.projectPoints(
+        target.reshape(1, 1, 3), np.zeros(3), np.array([-25.0, -15.0, 200.0]), K, np.zeros(5)
+    )
+    p2, _ = _cv2.projectPoints(target.reshape(1, 1, 3), rvec2, tvec2, K, np.zeros(5))
+    pixel1 = p1.reshape(2).tolist()
+    pixel2 = p2.reshape(2).tolist()
 
     resp = client.post(
         "/api/feature",
         json={
-            "feature_id": "f1",
+            "feature_id": "f_triangulated",
             "clicks": [
-                {"photo_id": "top_down", "pixel": [500.0, 500.0]},
-                {"photo_id": "top_down", "pixel": [400.0, 400.0]},
+                {"photo_id": "photo_view_1", "pixel": pixel1},
+                {"photo_id": "photo_view_2", "pixel": pixel2},
             ],
         },
     )
-    assert resp.status_code == 501
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    assert "pcb_xyz_mm" in body
+    assert body["pcb_xyz_mm"][0] == pytest.approx(15.0, abs=0.05)
+    assert body["pcb_xyz_mm"][1] == pytest.approx(10.0, abs=0.05)
+    assert body["pcb_xyz_mm"][2] == pytest.approx(0.0, abs=0.05)
+    assert body["method"] == "triangulation_2_views"
+    assert body["n_views"] == 2
+    assert "triangulation_rms_px" in body
+    assert "max_residual_px" in body
+
+
+def test_post_feature_seven_clicks_returns_400(app_factory) -> None:
+    """v1 caps at 6 views; 7 clicks must return 400 with a clear message."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    # Establish a single pose so the photo lookups don't 404 first.
+    anchors_resp = client.post("/api/anchors", json=_valid_anchors_payload())
+    assert anchors_resp.status_code == 200
+
+    resp = client.post(
+        "/api/feature",
+        json={
+            "feature_id": "f_too_many",
+            "clicks": [{"photo_id": "top_down", "pixel": [500.0, 500.0]} for _ in range(7)],
+        },
+    )
+    assert resp.status_code == 400
     body = resp.get_json()
     assert "error" in body
-    assert "triangulation" in body["error"].lower()
-    assert "PR-3" in body["error"]
-    assert body["n_clicks_received"] == 2
+    assert "6" in body["error"]
+
+
+def test_post_feature_two_clicks_unknown_photo_returns_404(app_factory) -> None:
+    """If any of the multi-view clicks references an unknown photo_id, return 404."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    # Establish one pose; the second photo_id is intentionally absent.
+    anchors_resp = client.post("/api/anchors", json=_valid_anchors_payload())
+    assert anchors_resp.status_code == 200
+
+    resp = client.post(
+        "/api/feature",
+        json={
+            "feature_id": "f_dangling",
+            "clicks": [
+                {"photo_id": "top_down", "pixel": [500.0, 500.0]},
+                {"photo_id": "no_such_photo", "pixel": [400.0, 400.0]},
+            ],
+        },
+    )
+    assert resp.status_code == 404
+    assert "error" in resp.get_json()
+    assert "no_such_photo" in resp.get_json()["error"]
 
 
 def test_post_feature_zero_clicks_returns_400(app_factory) -> None:
@@ -392,6 +473,36 @@ def test_finalize_rejects_invalid_flag(app_factory) -> None:
     assert not (session.session_dir / "annotations.json").exists()
 
 
+def test_finalize_skips_unsolved_uploaded_photos(app_factory) -> None:
+    """A photo uploaded but never anchored is skipped from the final
+    annotations.json with a 'pose_skipped_uploaded_only:<id>' flag."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    # Upload one photo without anchoring it.
+    unsolved_id = _upload_test_photo(client)
+
+    # Set up one photo with a valid pose so finalize has something to emit.
+    anchors_resp = client.post("/api/anchors", json=_valid_anchors_payload())
+    assert anchors_resp.status_code == 200
+
+    resp = client.post("/api/finalize", json={})
+    assert resp.status_code == 200, resp.get_json()
+    out_path = Path(resp.get_json()["annotations_path"])
+    assert out_path.is_file()
+    annotations = json.loads(out_path.read_text(encoding="utf-8"))
+
+    # Unsolved photo MUST NOT appear in photos[]
+    photo_ids_in_annotations = [p["id"] for p in annotations["photos"]]
+    assert unsolved_id not in photo_ids_in_annotations
+    # Solved photo IS present.
+    assert "top_down" in photo_ids_in_annotations
+
+    # The flag is recorded in quality_summary.flags.
+    flags = annotations["quality_summary"]["flags"]
+    assert any(f.startswith("pose_skipped_uploaded_only:") and unsolved_id in f for f in flags)
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # GET /static/photos/<id>
 # ─────────────────────────────────────────────────────────────────────────
@@ -473,6 +584,92 @@ def test_finalize_auto_emits_feature_clicked_only_once(app_factory) -> None:
     annotations = json.loads((session.session_dir / "annotations.json").read_text())
     flags = annotations["quality_summary"]["flags"]
     assert "feature_clicked_only_once:f1" in flags
+
+
+def test_finalize_emits_triangulated_feature_with_correct_method_and_clicks(app_factory) -> None:
+    """A feature created via 2-view triangulation must emit annotations.json
+    with method=triangulation_2_views, populated per_photo_clicks (each with
+    reprojection_residual_px), and triangulation_rms_px / max_residual_px.
+
+    PR-3 introduced real triangulation in /api/feature; this regression test
+    closes the integration gap that the final pre-push review caught:
+    post_finalize was emitting all features as planar_intersection.
+    """
+    import cv2 as _cv2
+
+    app, _, _ = app_factory()
+    client = app.test_client()
+
+    # Two poses for the same world points.
+    payload1 = _valid_anchors_payload()
+    payload1["photo_id"] = "v1"
+    r1 = client.post("/api/anchors", json=payload1)
+    assert r1.status_code == 200, r1.get_json()
+
+    K = np.array([[1000.0, 0, 500.0], [0, 1000.0, 500.0], [0, 0, 1]], dtype=np.float64)  # noqa: N806
+    rvec2 = np.array([0.0, 0.3, 0.0])
+    tvec2 = np.array([-60.0, -15.0, 200.0])
+    world_pts = np.array([[0.0, 0.0, 0.0], [50.0, 0.0, 0.0], [50.0, 30.0, 0.0], [0.0, 30.0, 0.0]])
+    pixels2, _ = _cv2.projectPoints(world_pts, rvec2, tvec2, K, np.zeros(5))
+    payload2 = {
+        "photo_id": "v2",
+        "intrinsics": _make_test_intrinsics_dict(1000, 1000),
+        "image_size": [1000, 1000],
+        "anchors": [
+            {
+                "id": f"a{i}",
+                "pcb_xyz_mm": world_pts[i].tolist(),
+                "pixel": pixels2.reshape(-1, 2)[i].tolist(),
+            }
+            for i in range(4)
+        ],
+    }
+    r2 = client.post("/api/anchors", json=payload2)
+    assert r2.status_code == 200
+
+    target = np.array([15.0, 10.0, 0.0])
+    p1, _ = _cv2.projectPoints(
+        target.reshape(1, 1, 3),
+        np.zeros(3),
+        np.array([-25.0, -15.0, 200.0]),
+        K,
+        np.zeros(5),
+    )
+    p2, _ = _cv2.projectPoints(target.reshape(1, 1, 3), rvec2, tvec2, K, np.zeros(5))
+
+    feat_resp = client.post(
+        "/api/feature",
+        json={
+            "feature_id": "f_tri",
+            "clicks": [
+                {"photo_id": "v1", "pixel": p1.reshape(2).tolist()},
+                {"photo_id": "v2", "pixel": p2.reshape(2).tolist()},
+            ],
+        },
+    )
+    assert feat_resp.status_code == 200, feat_resp.get_json()
+
+    fin = client.post("/api/finalize", json={})
+    assert fin.status_code == 200, fin.get_json()
+    out_path = Path(fin.get_json()["annotations_path"])
+    annotations = json.loads(out_path.read_text(encoding="utf-8"))
+
+    features_emitted = annotations["features"]
+    assert len(features_emitted) == 1
+    feat = features_emitted[0]
+    assert feat["id"] == "f_tri"
+    assert feat["measurements"]["method"] == "triangulation_2_views"
+    # per_photo_clicks must contain BOTH views, each with reprojection_residual_px.
+    clicks = feat["measurements"]["per_photo_clicks"]
+    assert len(clicks) == 2
+    photo_ids = sorted(c["photo"] for c in clicks)
+    assert photo_ids == ["v1", "v2"]
+    for c in clicks:
+        assert "reprojection_residual_px" in c
+    assert "triangulation_rms_px" in feat["measurements"]
+    assert "max_residual_px" in feat["measurements"]
+    # visible_in must list both photos
+    assert sorted(feat["visible_in"]) == ["v1", "v2"]
 
 
 def test_finalize_updates_state_json_status_done(app_factory) -> None:
@@ -889,6 +1086,126 @@ def test_post_reference_wrong_corner_count_returns_400(app_factory) -> None:
         assert response.status_code == 400, f"expected 400 for n_corners={n_corners}"
 
 
+def test_post_reference_returns_pose_rms_mm(app_factory) -> None:
+    """The /api/reference response now carries pose_rms_mm so the UI
+    tier-badge logic can render Excellent/Good/Approximate/Try again."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+
+    # Project credit-card corners through a known pose to get pixel corners.
+    import cv2 as _cv2
+
+    K = np.array([[1000.0, 0, 100.0], [0, 1000.0, 75.0], [0, 0, 1]], dtype=np.float64)  # noqa: N806
+    rvec = np.array([0.0, 0.0, 0.0])
+    tvec = np.array([-42.8, -27.0, 200.0])
+    world_corners = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [85.60, 0.0, 0.0],
+            [85.60, 53.98, 0.0],
+            [0.0, 53.98, 0.0],
+        ]
+    )
+    pixel_corners, _ = _cv2.projectPoints(world_corners, rvec, tvec, K, np.zeros(5))
+    pixel_corners = pixel_corners.reshape(-1, 2).tolist()
+
+    payload = {
+        "photo_id": photo_id,
+        "reference_type": "credit_card",
+        "pixel_corners": pixel_corners,
+        "image_size": [200, 150],
+        "intrinsics": _make_test_intrinsics_dict(200, 150),
+    }
+    resp = client.post("/api/reference", json=payload)
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    assert "pose_rms_mm" in body
+    assert isinstance(body["pose_rms_mm"], float)
+    assert body["pose_rms_mm"] >= 0.0
+    assert body["pose_rms_mm"] < 5.0  # synthetic-clean clicks should be tight
+
+
+def test_post_reference_falls_back_to_default_intrinsics_when_no_exif(app_factory) -> None:
+    """Without intrinsics or lens_id, /api/reference still succeeds via the
+    FOV-class default, and quality_summary.flags carries 'intrinsics_estimated'."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+
+    # Project credit-card corners through a known pose (no intrinsics in payload).
+    import cv2 as _cv2
+
+    # Use what the FOV-default would compute: long_edge=200, focal_35=24 (wide-class).
+    # fx_px = 24 * 200 / 36 = 133.3
+    rvec = np.array([0.0, 0.0, 0.0])
+    tvec = np.array([-42.8, -27.0, 100.0])
+    K = np.array([[133.33, 0, 100.0], [0, 133.33, 75.0], [0, 0, 1]], dtype=np.float64)  # noqa: N806
+    world_corners = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [85.60, 0.0, 0.0],
+            [85.60, 53.98, 0.0],
+            [0.0, 53.98, 0.0],
+        ]
+    )
+    pixel_corners, _ = _cv2.projectPoints(world_corners, rvec, tvec, K, np.zeros(5))
+    pixel_corners = pixel_corners.reshape(-1, 2).tolist()
+
+    payload = {
+        "photo_id": photo_id,
+        "reference_type": "credit_card",
+        "pixel_corners": pixel_corners,
+        "image_size": [200, 150],
+        # No intrinsics, no lens_id, no exif.
+    }
+    resp = client.post("/api/reference", json=payload)
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    assert "pose" in body
+
+    state = client.get("/api/state").get_json()
+    assert "intrinsics_estimated" in state["flags"]
+
+
+def test_post_reference_uses_exif_focal_when_provided_in_request(app_factory) -> None:
+    """If the request body contains an `exif` dict with focal info, use it
+    instead of falling back to wide-class default. Flag still set
+    (intrinsics still 'estimated', not chessboard-calibrated)."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+
+    import cv2 as _cv2
+
+    # focal_35 = 28 (wide), long_edge=200 → fx_px = 28*200/36 = 155.5
+    rvec = np.array([0.0, 0.0, 0.0])
+    tvec = np.array([-42.8, -27.0, 100.0])
+    K = np.array([[155.55, 0, 100.0], [0, 155.55, 75.0], [0, 0, 1]], dtype=np.float64)  # noqa: N806
+    world_corners = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [85.60, 0.0, 0.0],
+            [85.60, 53.98, 0.0],
+            [0.0, 53.98, 0.0],
+        ]
+    )
+    pixel_corners, _ = _cv2.projectPoints(world_corners, rvec, tvec, K, np.zeros(5))
+    pixel_corners = pixel_corners.reshape(-1, 2).tolist()
+
+    payload = {
+        "photo_id": photo_id,
+        "reference_type": "credit_card",
+        "pixel_corners": pixel_corners,
+        "image_size": [200, 150],
+        "exif": {"focal_length_35mm_equiv": 28.0},
+    }
+    resp = client.post("/api/reference", json=payload)
+    assert resp.status_code == 200, resp.get_json()
+    state = client.get("/api/state").get_json()
+    assert "intrinsics_estimated" in state["flags"]
+
+
 def test_marker_detect_stub_returns_null_corners(app_factory) -> None:
     """PR-2 stub: no auto-detect yet; PR-3 wires cv2.aruco."""
     app, session, server = app_factory()
@@ -899,25 +1216,82 @@ def test_marker_detect_stub_returns_null_corners(app_factory) -> None:
     assert response.get_json() == {"corners": None}
 
 
-def test_next_prompt_stub_returns_typed_shape(app_factory) -> None:
-    """PR-2 stub returns the shape the UI expects; PR-3 implements scoring."""
-    app, session, server = app_factory()
+def test_reproject_all_returns_by_photo_dict_after_triangulation(app_factory) -> None:
+    """After triangulating one feature, /api/reproject_all returns predicted
+    pixels + error_mm per (photo, feature)."""
+    import cv2 as _cv2
+
+    app, _, _ = app_factory()
     client = app.test_client()
-    response = client.get("/api/next_prompt")
-    assert response.status_code == 200
-    body = response.get_json()
-    assert body["direction"] in {"top", "+long", "-long", "+short", "-short"}
-    assert "reason" in body
-    assert isinstance(body["coverage_cells"], dict)
-    assert "PR-3" in body["reason"], "stub reason must self-document as not-yet-implemented"
+
+    # Set up two poses + a triangulated feature (re-using the fixture pattern).
+    payload1 = _valid_anchors_payload()
+    payload1["photo_id"] = "v1"
+    r1 = client.post("/api/anchors", json=payload1)
+    assert r1.status_code == 200, r1.get_json()
+
+    K = np.array([[1000.0, 0, 500.0], [0, 1000.0, 500.0], [0, 0, 1]], dtype=np.float64)  # noqa: N806
+    rvec2 = np.array([0.0, 0.3, 0.0])
+    tvec2 = np.array([-60.0, -15.0, 200.0])
+    world_pts = np.array([[0.0, 0.0, 0.0], [50.0, 0.0, 0.0], [50.0, 30.0, 0.0], [0.0, 30.0, 0.0]])
+    pixels2, _ = _cv2.projectPoints(world_pts, rvec2, tvec2, K, np.zeros(5))
+    payload2 = {
+        "photo_id": "v2",
+        "intrinsics": _make_test_intrinsics_dict(1000, 1000),
+        "image_size": [1000, 1000],
+        "anchors": [
+            {
+                "id": f"a{i}",
+                "pcb_xyz_mm": world_pts[i].tolist(),
+                "pixel": pixels2.reshape(-1, 2)[i].tolist(),
+            }
+            for i in range(4)
+        ],
+    }
+    r2 = client.post("/api/anchors", json=payload2)
+    assert r2.status_code == 200, r2.get_json()
+
+    target = np.array([15.0, 10.0, 0.0])
+    p1, _ = _cv2.projectPoints(
+        target.reshape(1, 1, 3), np.zeros(3), np.array([-25.0, -15.0, 200.0]), K, np.zeros(5)
+    )
+    p2, _ = _cv2.projectPoints(target.reshape(1, 1, 3), rvec2, tvec2, K, np.zeros(5))
+
+    feat_resp = client.post(
+        "/api/feature",
+        json={
+            "feature_id": "f_tri",
+            "clicks": [
+                {"photo_id": "v1", "pixel": p1.reshape(2).tolist()},
+                {"photo_id": "v2", "pixel": p2.reshape(2).tolist()},
+            ],
+        },
+    )
+    assert feat_resp.status_code == 200, feat_resp.get_json()
+
+    resp = client.get("/api/reproject_all")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert "by_photo" in body
+    assert "v1" in body["by_photo"]
+    assert "v2" in body["by_photo"]
+    v1_entries = body["by_photo"]["v1"]
+    assert len(v1_entries) == 1
+    assert v1_entries[0]["feature_id"] == "f_tri"
+    assert "predicted_pixel" in v1_entries[0]
+    assert "error_mm" in v1_entries[0]
+    assert isinstance(v1_entries[0]["predicted_pixel"], list)
+    assert len(v1_entries[0]["predicted_pixel"]) == 2
 
 
-def test_reproject_all_stub_returns_empty_features(app_factory) -> None:
-    app, session, server = app_factory()
+def test_reproject_all_empty_state_returns_empty_by_photo(app_factory) -> None:
+    """No features → by_photo: {} (still well-typed object)."""
+    app, _, _ = app_factory()
     client = app.test_client()
-    response = client.get("/api/reproject_all")
-    assert response.status_code == 200
-    assert response.get_json() == {"features": []}
+    resp = client.get("/api/reproject_all")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body == {"by_photo": {}}
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -964,3 +1338,90 @@ def test_legacy_wireframe_endpoint_still_functional(app_factory) -> None:
         f"wireframe must be functional (200) or report no-pose-solved (404), "
         f"not {response.status_code}"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# GET /api/marker_detect/<photo_id>
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_marker_detect_returns_corners_for_aruco_photo(app_factory, tmp_path) -> None:
+    """When a photo with a marker is uploaded, /api/marker_detect returns 4 corners."""
+    import cv2 as _cv2
+
+    from agent_spatial_toolkit.server.marker_detect import MARKER_DICT, MARKER_ID
+
+    aruco_dict = _cv2.aruco.getPredefinedDictionary(MARKER_DICT)
+    marker = _cv2.aruco.generateImageMarker(aruco_dict, MARKER_ID, 200)
+    canvas = np.full((800, 800), 255, dtype=np.uint8)
+    canvas[300:500, 300:500] = marker
+    photo_path = tmp_path / "with_marker.png"
+    _cv2.imwrite(str(photo_path), canvas)
+
+    app, _, _ = app_factory()
+    client = app.test_client()
+    with photo_path.open("rb") as f:
+        upload = client.post("/api/photo", data=f.read(), content_type="image/png")
+    assert upload.status_code == 200
+    photo_id = upload.get_json()["photo_id"]
+
+    resp = client.get(f"/api/marker_detect/{photo_id}")
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    assert body["corners"] is not None
+    assert len(body["corners"]) == 4
+
+
+def test_marker_detect_returns_null_when_no_marker(app_factory) -> None:
+    """A photo with no marker returns {corners: null}."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+    resp = client.get(f"/api/marker_detect/{photo_id}")
+    assert resp.status_code == 200
+    assert resp.get_json()["corners"] is None
+
+
+def test_marker_detect_returns_404_when_photo_missing(app_factory) -> None:
+    """An unknown photo_id returns 404."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    resp = client.get("/api/marker_detect/no_such_photo")
+    assert resp.status_code == 404
+
+
+def test_next_prompt_no_state_starts_with_top(app_factory) -> None:
+    """A fresh session starts with direction='top'."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    resp = client.get("/api/next_prompt")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["direction"] == "top"
+    assert "coverage_cells" in body
+    assert "features" in body
+
+
+def test_next_prompt_after_top_photo_advances_to_side(app_factory) -> None:
+    """After a top-down photo with a single-view feature, prompt picks a side."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    anchors_resp = client.post("/api/anchors", json=_valid_anchors_payload())
+    assert anchors_resp.status_code == 200
+    feature_resp = client.post(
+        "/api/feature",
+        json={
+            "feature_id": "f1",
+            "photo_id": "top_down",
+            "pixel": [500.0, 500.0],
+            "z_assumed_mm": 0.0,
+        },
+    )
+    assert feature_resp.status_code == 200
+
+    resp = client.get("/api/next_prompt")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["direction"] != "top"  # advanced past top
+    assert body["direction"] in {"+long", "-long", "+short", "-short"}
+    assert "second view" in body["reason"].lower() or "another angle" in body["reason"].lower()

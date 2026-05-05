@@ -324,6 +324,7 @@ def test_quality_flags_constant_is_complete() -> None:
         "feature_clicked_only_once",
         "feature_high_triangulation_rms",
         "ultrawide_lens_rejected",
+        "pose_skipped_uploaded_only",  # wizard redesign PR-3: upload-only finalize skip
     }
     assert set(QUALITY_FLAGS.keys()) == expected
 

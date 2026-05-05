@@ -975,8 +975,39 @@ def _register_routes(app: Flask) -> None:
 
     @app.get("/api/marker_detect/<path:photo_id>")
     def get_marker_detect(photo_id: str) -> Any:
-        """Stub: real cv2.aruco.detectMarkers wiring lands in PR-3."""
-        return jsonify({"corners": None})
+        """Run cv2.aruco.detectMarkers against the photo on disk.
+
+        Returns ``{"corners": [[x, y], [x, y], [x, y], [x, y]]}`` clockwise
+        from top-left when the wizard's MARKER_ID is found; ``{"corners":
+        null}`` when no marker is detected (the UI falls through to the
+        manual corner walkthrough). 404 if the photo file is missing on
+        disk.
+        """
+        from werkzeug.utils import secure_filename
+
+        from agent_spatial_toolkit.server.marker_detect import detect_marker_corners
+
+        safe_id = secure_filename(photo_id)
+        if not safe_id or safe_id != photo_id:
+            return jsonify({"error": "invalid photo_id"}), 404
+
+        session: Session = app.config["SESSION"]
+        photos_dir = session.session_dir / "photos"
+        candidates = list(photos_dir.glob(f"{safe_id}.*"))
+        # Filter to safe candidates only (no traversal escape).
+        photos_dir_resolved = photos_dir.resolve()
+        safe_candidates = [c for c in candidates if c.resolve().is_relative_to(photos_dir_resolved)]
+        if not safe_candidates:
+            return jsonify({"error": f"photo file for {safe_id} not found on disk"}), 404
+
+        try:
+            corners = detect_marker_corners(safe_candidates[0])
+        except FileNotFoundError:
+            return jsonify({"error": f"photo file for {safe_id} not found on disk"}), 404
+
+        if corners is None:
+            return jsonify({"corners": None})
+        return jsonify({"corners": [[x, y] for x, y in corners]})
 
     @app.get("/api/next_prompt")
     def get_next_prompt() -> Any:

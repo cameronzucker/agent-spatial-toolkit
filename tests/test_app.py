@@ -1084,3 +1084,53 @@ def test_legacy_wireframe_endpoint_still_functional(app_factory) -> None:
         f"wireframe must be functional (200) or report no-pose-solved (404), "
         f"not {response.status_code}"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# GET /api/marker_detect/<photo_id>
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_marker_detect_returns_corners_for_aruco_photo(app_factory, tmp_path) -> None:
+    """When a photo with a marker is uploaded, /api/marker_detect returns 4 corners."""
+    import cv2 as _cv2
+
+    from agent_spatial_toolkit.server.marker_detect import MARKER_DICT, MARKER_ID
+
+    aruco_dict = _cv2.aruco.getPredefinedDictionary(MARKER_DICT)
+    marker = _cv2.aruco.generateImageMarker(aruco_dict, MARKER_ID, 200)
+    canvas = np.full((800, 800), 255, dtype=np.uint8)
+    canvas[300:500, 300:500] = marker
+    photo_path = tmp_path / "with_marker.png"
+    _cv2.imwrite(str(photo_path), canvas)
+
+    app, _, _ = app_factory()
+    client = app.test_client()
+    with photo_path.open("rb") as f:
+        upload = client.post("/api/photo", data=f.read(), content_type="image/png")
+    assert upload.status_code == 200
+    photo_id = upload.get_json()["photo_id"]
+
+    resp = client.get(f"/api/marker_detect/{photo_id}")
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    assert body["corners"] is not None
+    assert len(body["corners"]) == 4
+
+
+def test_marker_detect_returns_null_when_no_marker(app_factory) -> None:
+    """A photo with no marker returns {corners: null}."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+    resp = client.get(f"/api/marker_detect/{photo_id}")
+    assert resp.status_code == 200
+    assert resp.get_json()["corners"] is None
+
+
+def test_marker_detect_returns_404_when_photo_missing(app_factory) -> None:
+    """An unknown photo_id returns 404."""
+    app, _, _ = app_factory()
+    client = app.test_client()
+    resp = client.get("/api/marker_detect/no_such_photo")
+    assert resp.status_code == 404

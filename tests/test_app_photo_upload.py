@@ -3,6 +3,9 @@
 Covers the wizard's photo-capture step (design §2 step 4 / §3 HEIC handling).
 The endpoint accepts JPEG/PNG/HEIC/HEIF, transparently decodes HEIC via
 pillow-heif, hashes the file, and persists JPEG to <session>/photos/<id>.jpg.
+
+The ``app_factory`` fixture is defined in :mod:`tests.conftest` and
+resolved automatically by pytest.
 """
 
 from __future__ import annotations
@@ -10,46 +13,9 @@ from __future__ import annotations
 import hashlib
 import io
 from collections.abc import Callable
-from pathlib import Path
 
 import pytest
 from PIL import Image
-
-from agent_spatial_toolkit.server.app import create_app
-from agent_spatial_toolkit.server.session import create_session
-
-
-class _StubServer:
-    """Minimal Server stand-in (mirrors tests/test_app.py).
-
-    Duplicated rather than imported across test modules to avoid coupling
-    test files; refactoring the fixture into ``tests/conftest.py`` would
-    broaden sharing but is out of scope for this task.
-    """
-
-    def __init__(self) -> None:
-        self.shutdown_called = False
-
-    def shutdown(self) -> None:
-        self.shutdown_called = True
-
-
-@pytest.fixture
-def app_factory(tmp_path: Path) -> Callable:
-    """Return a factory producing (app, session, server) tuples per test.
-
-    Mirrors the fixture in tests/test_app.py — see module docstring above
-    for why this is intentionally duplicated rather than shared.
-    """
-
-    def _make():
-        session = create_session(part_id="testpart", base_dir=tmp_path / "sessions")
-        server = _StubServer()
-        app = create_app(server=server, session=session)
-        app.config["TESTING"] = True
-        return app, session, server
-
-    return _make
 
 
 def _make_jpeg_bytes(width: int = 200, height: int = 150) -> bytes:

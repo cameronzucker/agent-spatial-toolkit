@@ -1,47 +1,20 @@
-"""Tests for server/app.py — Flask routes for the wizard API (spec §4)."""
+"""Tests for server/app.py — Flask routes for the wizard API (spec §4).
+
+The ``app_factory`` fixture and ``_StubServer`` helper used by these
+tests are defined in :mod:`tests.conftest` and resolved automatically
+by pytest.
+"""
 
 from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable
-from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
 
 from agent_spatial_toolkit.pipeline.intrinsics import Intrinsics
-from agent_spatial_toolkit.server.app import create_app
-from agent_spatial_toolkit.server.session import create_session
-
-
-class _StubServer:
-    """Minimal Server stand-in for /api/finalize shutdown.
-
-    The lifecycle.Server class wraps a real WSGI socket; tests use Flask's
-    test client, so a stub that just records shutdown() is sufficient.
-    """
-
-    def __init__(self) -> None:
-        self.shutdown_called = False
-
-    def shutdown(self) -> None:
-        self.shutdown_called = True
-
-
-@pytest.fixture
-def app_factory(tmp_path: Path) -> Callable:
-    """Return a factory producing (app, session, server) tuples per test."""
-
-    def _make():
-        session = create_session(part_id="testpart", base_dir=tmp_path / "sessions")
-        server = _StubServer()
-        app = create_app(server=server, session=session)
-        app.config["TESTING"] = True
-        return app, session, server
-
-    return _make
 
 
 def _make_test_intrinsics_dict(width: int = 1000, height: int = 1000) -> dict:

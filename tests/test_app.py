@@ -320,6 +320,30 @@ def test_post_feature_legacy_single_pixel_shape_still_works(app_factory) -> None
     assert len(body["pcb_xyz_mm"]) == 3
 
 
+def test_post_feature_upload_only_photo_returns_404(app_factory) -> None:
+    """Regression: /api/photo creates photo entries with intrinsics=None;
+    /api/feature must 404 (matching the wireframe handler's contract)
+    rather than 500 with a misleading 'stored intrinsics are malformed'
+    message. Discovered by the legacy regression suite in Task 7."""
+    app, session, server = app_factory()
+    client = app.test_client()
+    photo_id = _upload_test_photo(client)
+    # Note: NO /api/reference call — photo is upload-only
+    response = client.post(
+        "/api/feature",
+        json={
+            "feature_id": "usb_c",
+            "photo_id": photo_id,
+            "pixel": [200, 250],
+        },
+    )
+    assert response.status_code == 404, (
+        f"upload-only photo should return 404, not {response.status_code}: "
+        f"{response.get_data(as_text=True)}"
+    )
+    assert "no pose" in response.get_json()["error"].lower()
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # POST /api/finalize
 # ─────────────────────────────────────────────────────────────────────────

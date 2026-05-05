@@ -803,6 +803,15 @@ def _register_routes(app: Flask) -> None:
             return jsonify(
                 {"error": f"photo '{photo_id}' has no pose; call /api/anchors first"}
             ), 404
+        # Match the wireframe handler's guard (app.py ~1076): an upload-only
+        # photo (created via /api/photo without a subsequent /api/reference
+        # or /api/anchors call) has a photo entry but no pose/intrinsics yet.
+        # Without this check, _intrinsics_from_dict(None) raises TypeError
+        # which the surrounding except returns as 500 "stored intrinsics are
+        # malformed" — wrong status, wrong message. Return 404 like the
+        # legacy contract for "no pose for this photo yet".
+        if photo_entry.get("pose") is None or photo_entry.get("intrinsics") is None:
+            return jsonify({"error": f"no pose for photo {photo_id}"}), 404
 
         try:
             intrinsics = _intrinsics_from_dict(photo_entry["intrinsics"])
